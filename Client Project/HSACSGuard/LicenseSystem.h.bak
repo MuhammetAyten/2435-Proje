@@ -1,0 +1,19 @@
+#pragma once
+#include "stdafx.h"
+#include "Pearl Engine.h"
+// IPLISANS
+
+static string serverAdlari[] = { xorstr("SunucuName") };
+// gün, ay, yýl
+static uint32 lisansTarih[] = { 01, 01, 2022 };
+// iki lisans þekli de ayný anda çalýþýr
+static string ipLisanslari[] = { xorstr("127.0.0.1"), xorstr("193.160.215.63"), xorstr("45.143.98.30"), xorstr("213.238.167.21") };
+// x den öncesine bakar
+static string subnetLisanlar[] = { xorstr("999") };  //999 olan yere ip eklenecek son noktadan sonra xx koyulmalý. Örneðin : 127.0.0.xx
+
+extern DWORD WINAPI LicenseEngine(PearlEngine* e);
+extern bool IsLicensed(std::string ip);
+
+//  127.0.0.1		-	Local
+//	193.160.215.63	-	Msoft
+//  45.143.98.30	-	Msoýft2

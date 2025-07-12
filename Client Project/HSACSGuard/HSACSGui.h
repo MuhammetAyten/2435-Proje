@@ -1,0 +1,9 @@
+#pragma once
+#include "stdafx.h" 
+#include <cstdint>
+#include <memory>
+#include <thread>
+#include <string>
+#include "HSACSEngine.h"
+void UIMain();
+void PatchMulti();

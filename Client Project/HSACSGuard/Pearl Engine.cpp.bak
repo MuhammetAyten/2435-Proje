@@ -1,0 +1,4953 @@
+#include "Pearl Engine.h"
+#include "PearlGui.h"
+#include <thread>
+#include <future>
+#include <TlHelp32.h>
+#include "sha1.hpp"
+#include "LicenseSystem.h"
+#include "RC5/RC5.h"
+#include "CSpell.h"
+
+void SendHWID();
+
+extern void Shutdown(string message = "");
+extern string WtoString(WCHAR s[]);
+extern string strToLower(string str);
+
+std::vector<uint16> antiAFKProto = {0};
+
+
+bool uiINIT = false;
+bool pusINIT = false;
+bool tmpItemsINIT = false;
+
+vector<ProcessInfo> processTMP;
+string tmpGraphics = xorstr("<unknown>");
+string tmpProcessor = xorstr("<unknown>");
+
+typedef struct
+{
+private:
+	void* pVoid;
+public:
+	unsigned int Size;
+	BYTE* Data;
+}RECV_DATA;
+
+typedef int (WINAPI* MyOldRecv) (SOCKET, uint8*, int, int);
+typedef int (WSAAPI* MyRecv) (SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WINAPI* MySend) (SOCKET, char*, int, int);
+typedef int (WINAPI* MyConnect) (SOCKET, const sockaddr*, int);
+typedef int (WSAAPI* MyWSAConnect) (SOCKET, const sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
+typedef int (WSAAPI* MyWSAStartup) (WORD, LPWSADATA);
+typedef int (WINAPI* MyTerminateProcess) (HANDLE hProcess, UINT uExitCode);
+typedef int (WINAPI* MyExitProcess) (UINT uExitCode);
+typedef int (WINAPI* MyLoadTBL) (const std::string& szFN);
+
+MyOldRecv OrigOldRecv = NULL;
+MyRecv OrigRecv = NULL;
+MySend OrigSend = NULL;
+MyConnect OrigConnect = NULL;
+MyWSAConnect OrigWSAConnect = NULL;
+MyWSAStartup OrigWSAStartup = NULL;
+MyTerminateProcess OrigTerminateProcess = NULL;
+MyExitProcess OrigExitProcess = NULL;
+MyLoadTBL OrigLoadTBL = NULL;
+
+bool allowAlive = true;
+bool gameStarted = false;
+bool isAlive = false;
+
+HANDLE thisProc = NULL;
+DWORD KO_ADR = 0x0;
+const DWORD KO_WH = 0x758;
+const DWORD KO_PTR_PKT = 0x00F368D8;
+const DWORD KO_SND_FNC = 0x004A58F0;
+const DWORD KO_ACC = 0x00C957B8;
+
+void LM_Send(Packet * pkt);
+void __stdcall LM_Shutdown(std::string log, std::string graphicCards = tmpGraphics, std::string processor = tmpProcessor);
+void LM_StayAlive();
+void LM_SendProcess(uint16 toWHO);
+
+const DWORD KO_FNSBB = KO_FNSB;
+
+CSpell* GetSkillBase(int iSkillID)
+{
+	__asm {
+		mov ecx, KO_SMMB
+		mov ecx, DWORD PTR DS : [ecx]
+		push iSkillID
+		call KO_FNSBB
+	}
+}
+
+bool CheckSkill(DWORD skillID)
+{
+	CSpell* spell = GetSkillBase(skillID);
+	if (spell) {
+		auto itcrc = Engine->skillcrc.find(spell->dwID + 2031);
+		if (itcrc != Engine->skillcrc.end())
+		{
+			SpellCRC crc(crc32((uint8*)(DWORD)spell, 0xA8, -1), crc32((uint8*)((DWORD)spell + 0xB4), 0x2C, -1));
+			return itcrc->second.part1 == crc.part1 && itcrc->second.part2 == crc.part2;
+		}
+	}
+	return false;
+}
+
+// Nick renk, tip deðiþtirme
+std::string objTMPStringX = "";
+
+void SetNameString(DWORD userBase, std::string text, DWORD color, DWORD fontStyle)
+{
+
+	if (!userBase)
+		return;
+
+
+
+
+	DWORD fontBase = *(DWORD*)(userBase + 0x400/*0x3AC*/); // font olayý
+
+	if (IsBadReadPtr((void*)fontBase, sizeof(DWORD)))
+		return;
+	if (!fontBase)
+		return;
+
+	//printf("\n fontBase = %02X -- userBase  %02X", fontBase, userBase);
+
+	objTMPStringX = text;
+	__asm {
+		push fontStyle
+		push offset objTMPStringX
+		mov ecx, fontBase
+		call KO_UIF_SET_FONT_STRING
+	}
+
+	*(DWORD*)(userBase + 0x738 /*0x6A0*/) = color; // user nick color
+	*(DWORD*)(fontBase +  0x44) = color; // font color
+}
+// ----------------------------------------------------------
+
+bool PearlEngine::WordGuardSystem(std::string Word, uint8 WordStr)
+{
+	char* pword = &Word[0];
+	bool bGuard[32] = { false };
+	std::string WordGuard = "qwertyuopadfhsgcijklzxvbnmQWERTYUOPSGICADFHJKLZXVBNM1234567890";
+	char* pWordGuard = &WordGuard[0];
+	for (uint8 i = 0; i < WordStr; i++)
+	{
+		for (uint8 j = 0; j < strlen(pWordGuard); j++)
+			if (pword[i] == pWordGuard[j])
+				bGuard[i] = true;
+
+		if (bGuard[i] == false)
+			return false;
+	}
+	return true;
+}
+
+// yeni eklendi
+DWORD WINAPI PearlEngine::SuspendCheck(PearlEngine* e)
+{
+	Sleep(1000);
+	DWORD TimeTest1 = 0, TimeTest2 = 0;
+	while (true)
+	{
+		Sleep(1000);
+		/*TimeTest1 = TimeTest2;
+		TimeTest2 = GetTickCount();
+		if (TimeTest1 != 0)
+		{
+			Sleep(1000);
+			if ((TimeTest2 - TimeTest1) > 8000)
+				e->Shutdown(xorstr("Suspend Algýlandý. Lütfen programýnýzý kapatýn."));  // Bu hatayý alan kiþiler "Suspend" etmeye çalýþmýþ demektir.
+		}
+		if (WaitForSingleObject(e->MainThread, 1) == WAIT_OBJECT_0)
+			e->Shutdown(xorstr("All the pieces of the game can't be working together."));*/
+	}
+}
+// -- yeni eklendi
+
+std::string forbiddenModules[] = { xorstr("dbk64"), xorstr("dbk32"), xorstr("pchunter"), xorstr("hacker"), xorstr("PROCEXP152"), xorstr("BlackBoneDrv10"), xorstr("since"), xorstr("ntice"), xorstr("winice"), xorstr("syser"), xorstr("77fba431") };
+
+DWORD WINAPI DriverScan(LPVOID lParam)
+{
+	VIRTUALIZER_START
+	while (true) 
+	{
+		Sleep(3000);
+		LPVOID drivers[ARRAY_SIZE];
+		DWORD cbNeeded;
+		int cDrivers, i;
+		WCHAR szDriver[ARRAY_SIZE];
+		if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded) && cbNeeded < sizeof(drivers))
+		{
+			cDrivers = cbNeeded / sizeof(drivers[0]);
+			for (i = 0; i < cDrivers; i++)
+			{
+				if (GetDeviceDriverBaseNameW(drivers[i], szDriver, sizeof(szDriver) / sizeof(szDriver[0])))
+				{
+					string driverName = strToLower(WtoString(szDriver));
+					for (string fbDriver : forbiddenModules) {
+						if (driverName.find(strToLower(fbDriver)) != std::string::npos) {
+							//string s1 = xorstr("An 3rd party tools has been detected on your system: %s\n");
+							//string s2 = xorstr("If you don't use any hacking stuff, ");  // Cheat Engine için uyarý ekle
+							//string s3 = xorstr("please restart computer and try again.");
+							//Shutdown(string_format(s1 + s2 + s3, driverName.c_str()));
+						}
+					}
+				}
+			}
+		}
+	}
+	VIRTUALIZER_END
+}
+
+DWORD WINAPI AliveSend(LPVOID lParam)
+{
+	VIRTUALIZER_START
+	while (true) {
+		Sleep(50000);
+		//Engine->StayAlive();
+	}
+	VIRTUALIZER_END
+}
+
+// pm hook
+typedef void(WINAPI* tGetChild)(const std::string& szString,DWORD nUnkown);
+tGetChild oGetChild;
+string tmp_gc_string = "";
+
+
+
+void __stdcall GetChildByID_Hook(const std::string& szString,DWORD nUnkown)
+{
+
+	DWORD thisPtr;
+	__asm
+	{
+		MOV thisPtr, ECX
+		pushad
+		pushfd
+	}
+	
+
+
+	tmp_gc_string = szString;
+	
+
+	if (tmp_gc_string == "exit_id")
+	{
+		DWORD tmp = 0;
+		Engine->GetChildByID(thisPtr, "btn_open", tmp);
+	
+		if (tmp) // whisper_close
+		{
+			Engine->privatemessages.push_back(new HookPM(thisPtr, false));
+		}
+		else { // whisper open
+			Engine->privatemessages.push_back(new HookPM(thisPtr, true));
+		}
+	}
+
+	_asm
+	{
+		popfd
+		popad
+		MOV ECX, thisPtr
+		MOV EAX, szString
+		push nUnkown
+		PUSH EAX
+		CALL oGetChild
+	
+	}
+}
+void __declspec(naked)GetChildByID_Hook2() {
+	__asm {
+		pushad
+		cmp dword ptr[esp+0x24],0
+		je cikk
+		push ecx
+		push [esp + 0x28]
+		call GetChildByID_Hook
+		cikk:
+		popad
+
+		mov eax, [esp + 04]
+		sub esp, 0x8
+		mov edx, 0x410DF7
+		jmp edx
+	}
+}
+
+typedef HINSTANCE(WINAPI* tShellExecuteA)(HWND hwnd, LPCSTR lpOperation, LPCSTR lpFile, LPCSTR lpParameters, LPCSTR lpDirectory, INT nShowCmd);
+tShellExecuteA oShellExecuteA;
+
+HINSTANCE WINAPI hkShellExecuteA(HWND hwnd, LPCSTR lpOperation, LPCSTR lpFile, LPCSTR lpParameters, LPCSTR lpDirectory, INT nShowCmd)
+{
+	string tmp = lpFile;
+	if (Engine->StringHelper->IsContains(tmp, "explore")) {
+		exit(0);
+		return (HINSTANCE)0x90;
+	}
+	else
+		return oShellExecuteA(hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd);
+}
+
+//Skill Range Start
+const DWORD Func_AreaMove = 0x5A4459; //2369
+
+int tmpRange = 0;
+float rangeLimit = 999.0f;
+bool outofRange = false;
+float charX = 0, charY = 0, charZ = 0;
+float X = 0, Y = 0, Z = 0;
+float nearstX = 0, nearstZ = 0;
+
+bool isInRectangle(float centerX, float centerY, float radius, float x, float y)
+{
+	return x >= centerX - radius && x <= centerX + radius && y >= centerY - radius && y <= centerY + radius;
+}
+
+bool isPointInCircle(float centerX, float centerY, float radius, float x, float y)
+{
+	if (isInRectangle(centerX, centerY, radius, x, y))
+	{
+		float dx = centerX - x;
+		float dy = centerY - y;
+		dx *= dx;
+		dy *= dy;
+		float distanceSquared = dx + dy;
+		float radiusSquared = radius * radius;
+		return distanceSquared <= radiusSquared;
+	}
+	return false;
+}
+
+void __fastcall CalculateNearestPoint()
+{
+	float vX = X - charX;
+	float vY = Z - charZ;
+	float magV = sqrt(vX*vX + vY*vY);
+	float aX = charX + vX / magV * rangeLimit;
+	float aY = charZ + vY / magV * rangeLimit;
+
+	nearstX = aX;
+	nearstZ = aY;
+}
+
+bool skillRange = true;  // Alan Skili Açma ve kapama -True - False 
+DWORD nEAX = 0;
+
+DWORD __declspec(naked) hkAreaMove()
+{
+
+	__asm {
+		cmp byte ptr skillRange, 0
+		jz gec
+		cmp ebx, 0x00002734 // y??e mi alan skill mi
+		je limitle
+		cmp ebx, 0x00002737 // y??e mi alan skill mi
+		je limitle
+		gec :
+			mov ecx, [ebp + 0x10]
+			fld dword ptr[ecx]
+			fstp dword ptr[eax + 0x12C]
+			fld dword ptr[ecx + 4]
+			fstp dword ptr[eax + 0x130]
+			fld dword ptr[ecx + 8]
+			fstp dword ptr[eax + 0x134]
+			mov edx, [Func_AreaMove]
+			mov ebx, 0x1D
+			add edx, ebx
+			push edx // fonksiyon sonu
+			ret
+			limitle :
+			mov edx, [KO_PTR_CHR]
+			mov edx, [edx]
+			fld dword ptr[edx + 0xEC]
+			fstp dword ptr charX
+			fld dword ptr[edx + 0xF0]
+			fstp dword ptr charY
+			fld dword ptr[edx + 0xF4]
+			fstp dword ptr charZ
+			mov ecx, [ebp + 0x10]
+			fld dword ptr[ecx]
+			fstp dword ptr X
+			fld dword ptr[ecx + 4]
+			fstp dword ptr Y
+			fld dword ptr[ecx + 8]
+			fstp dword ptr Z
+			fld dword ptr[ecx + 4] 
+			fstp dword ptr[eax + 0x130]
+			pushad
+	}
+	outofRange = !isPointInCircle(charX, charZ, rangeLimit, X, Z);
+	__asm {
+		call CalculateNearestPoint
+		popad
+		cmp byte ptr outofRange, 0
+		je gec
+		fld dword ptr nearstX
+		fstp dword ptr[eax + 0x12C]
+		fld dword ptr[eax + 0x12C]
+		fstp dword ptr[ecx]
+		fld dword ptr nearstZ
+		fstp dword ptr[eax + 0x134]
+		fld dword ptr[eax + 0x134]
+		fstp dword ptr[ecx + 8]
+		mov edx, [Func_AreaMove]
+		mov ebx, 0x1D
+		add edx, ebx
+		push edx // fonksiyon sonu
+		ret
+	}
+}
+
+const DWORD Func_RangeInstance = 0x0092E937; //2369
+
+DWORD __declspec(naked) hkRangeInstance()
+{
+	__asm {
+		pushad
+		mov eax, [edi + 0xC0]
+		mov tmpRange, eax
+		dec tmpRange
+		movd xmm0, tmpRange
+		cvtdq2ps xmm0, xmm0
+		movss rangeLimit, xmm0
+		popad
+		mov eax, 0x4037D0
+		call eax
+		mov edx, [Func_RangeInstance]
+		mov ebx, 5
+		add edx, ebx
+		push edx
+		ret
+	}
+}
+//Skill Range End
+
+bool PearlEngine::TitleWindow(LPCSTR WindowTitle)
+{
+	if (FindWindowA(NULL, WindowTitle) > 0) {
+		//return false;
+	/*	Shutdown(xorstr("Cheat Detected 0x1"));*/
+	}
+	return true;
+}
+
+#include <string>
+
+DWORD WINAPI PearlEngine::TitleCheck(PearlEngine* e)
+{
+	Sleep(30000);
+	VIRTUALIZER_START
+	while (true)
+	{
+		Sleep(5000);
+		std::string cheatengine = "Cheat Engine ";
+		for (int i = 0; i < 10; i++) {
+			std::string newcheat = cheatengine + std::to_string(i) + ".";
+			for (int x = 0; x < 10; x++) {
+				std::string newcheat2 = newcheat + std::to_string(x);
+				Engine->TitleWindow(newcheat2.c_str());
+				for (int s = 0; s < 10; s++) {
+					std::string newcheat3 = newcheat2 + "." + std::to_string(s);
+					Engine->TitleWindow(newcheat3.c_str());
+				}
+			}
+		}
+
+		/*Engine->TitleWindow("Add address");
+		Engine->TitleWindow("ArtMoney PRO v7.27");
+		Engine->TitleWindow("ArtMoney SE v7.31");
+		Engine->TitleWindow("ArtMoney SE v7.32");
+		Engine->TitleWindow("Cheat Engine 5.0");
+		Engine->TitleWindow("Cheat Engine 5.1");
+		Engine->TitleWindow("Cheat Engine 5.1.1");
+		Engine->TitleWindow("Cheat Engine 5.2");
+		Engine->TitleWindow("Cheat Engine 5.3");
+		Engine->TitleWindow("Cheat Engine 5.4");
+		Engine->TitleWindow("Cheat Engine 5.5");
+		Engine->TitleWindow("Cheat Engine 5.6");
+		Engine->TitleWindow("Cheat Engine 5.6.1");
+		Engine->TitleWindow("Cheat Engine 5.6.2");
+		Engine->TitleWindow("Cheat Engine 5.6.3");
+		Engine->TitleWindow("Cheat Engine 5.6.4");
+		Engine->TitleWindow("Cheat Engine 5.6.5");
+		Engine->TitleWindow("Cheat Engine 5.6.6");
+		Engine->TitleWindow("Cheat Engine 6.0");
+		Engine->TitleWindow("Cheat Engine 6.1");
+		Engine->TitleWindow("Cheat Engine 6.2");
+		Engine->TitleWindow("Cheat Engine 6.3");
+		Engine->TitleWindow("Cheat Engine 6.4");
+		Engine->TitleWindow("Cheat Engine 6.5");
+		Engine->TitleWindow("Cheat Engine 6.6");
+		Engine->TitleWindow("Cheat Engine 6.7");
+		Engine->TitleWindow("Cheat Engine 7.0");
+		Engine->TitleWindow("Cheat Engine 7.1");
+		Engine->TitleWindow("Cheat Engine 7.2");
+		Engine->TitleWindow("Cheat Engine");
+		Engine->TitleWindow("Created processes");
+		Engine->TitleWindow("D-C Bypass");
+		Engine->TitleWindow("DC-BYPASS By DjCheats  Public Vercion");
+		Engine->TitleWindow("HiDeToolz");
+		Engine->TitleWindow("HideToolz");
+		Engine->TitleWindow("Injector");
+		Engine->TitleWindow("Olly Debugger");
+		Engine->TitleWindow("Process Explorer 11.33");
+		Engine->TitleWindow("Process Explorer");
+		Engine->TitleWindow("T Search");
+		Engine->TitleWindow("WPE PRO");
+		Engine->TitleWindow("WPePro 0.9a");
+		Engine->TitleWindow("WPePro 1.3");
+		Engine->TitleWindow("hacker");
+		Engine->TitleWindow("rPE - rEdoX Packet Editor");
+		Engine->TitleWindow("OllyDbg");
+		Engine->TitleWindow("HxD");
+		Engine->TitleWindow("Process Hacker 2");
+		Engine->TitleWindow("Process Hacker");
+		Engine->TitleWindow("Ultimate Cheat");
+		Engine->TitleWindow("The following opcodes accessed the selected address");
+		Engine->TitleWindow("lalaker1");
+		Engine->TitleWindow("HiDeToolz");
+		Engine->TitleWindow("HideToolz");
+		Engine->TitleWindow("IDA!");
+		Engine->TitleWindow("The interactive disassembler");
+		Engine->TitleWindow("1nj3ct0r");
+		Engine->TitleWindow("injector");
+		Engine->TitleWindow("Injector");
+		Engine->TitleWindow("dreamfancy");
+		Engine->TitleWindow("pvp hile indir");
+		Engine->TitleWindow("dreamfancy");
+		Engine->TitleWindow("Knight Online tr hile indir");
+		Engine->TitleWindow("Knight Online oyun hileleri sitesi 2015");
+		Engine->TitleWindow("Knight Online Hilecim");
+		Engine->TitleWindow("Knight Online Hileleri");
+		Engine->TitleWindow("Knight Online Hile Ýndir");
+		Engine->TitleWindow("Online Oyun Hileleri");
+		Engine->TitleWindow("N-Jector by NOOB");
+		Engine->TitleWindow("[BETA] Hack Loader v1.0.2");
+		Engine->TitleWindow("[BETA] Hack Loader v1.0.3");
+		Engine->TitleWindow("Wallhack");
+		Engine->TitleWindow("Pro Damage");
+		Engine->TitleWindow("Wait Damage (7x)");
+		Engine->TitleWindow("Okçu hilesi");
+		Engine->TitleWindow("Daily Stage 2 (Günlük Aþama 2 )");
+		Engine->TitleWindow("Injector [FaithDEV]");
+		Engine->TitleWindow("Injector Gadget");
+		Engine->TitleWindow("OldSchoolInject");
+		Engine->TitleWindow("Extreme Injector");
+		Engine->TitleWindow("| Fortis Fortuna Adiuvat |");
+		Engine->TitleWindow("PHTrenbot");
+		Engine->TitleWindow("Kaynak Ýzleyicisi");*/
+		Engine->TitleWindow("Görev Yöneticisi");
+		/*Engine->TitleWindow("Process Lasso");
+		Engine->TitleWindow("System Explorer 7.0.0.5356");
+		Engine->TitleWindow("Minor Programý");
+		Engine->TitleWindow("Macro Minor");
+		Engine->TitleWindow("Minor Macro");
+		Engine->TitleWindow("Exe String Editore");
+		Engine->TitleWindow("DaveLombardo");
+		Engine->TitleWindow("ShowString");
+		Engine->TitleWindow("TAMORY");
+		Engine->TitleWindow("snoxd");
+		Engine->TitleWindow("SQL Scripts");
+		Engine->TitleWindow("odbg201");
+		Engine->TitleWindow("odbg202");
+		Engine->TitleWindow("OLLYDBG");
+		Engine->TitleWindow("ollydbG");
+		Engine->TitleWindow("PhantOm");
+		Engine->TitleWindow("Themida");
+		Engine->TitleWindow("Pointer Bulucu");
+		Engine->TitleWindow("OTO POINTER");
+		Engine->TitleWindow("Oto Pointer");
+		Engine->TitleWindow("HDRExporter");
+		Engine->TitleWindow("MoleBox Pro 2.6.4.2534");
+		Engine->TitleWindow("MoleBox Pro 2.6.4");
+		Engine->TitleWindow("otoPointer");
+		Engine->TitleWindow("Tbl Editör");
+		Engine->TitleWindow("Themida");
+		Engine->TitleWindow("Themida v1");
+		Engine->TitleWindow("Hooking");
+		Engine->TitleWindow("SOACS_Yourko_2017");
+		Engine->TitleWindow("Dll-Injectorv2 by Padmak");
+		Engine->TitleWindow("ThunderRT6FormDC");
+		Engine->TitleWindow("KoPluginGlobal_v7.0.8");
+		Engine->TitleWindow("PaidBot");
+		Engine->TitleWindow("Extreme Injector v3.5 by master131");
+		Engine->TitleWindow("Multi Macro Bot 1.0");
+		Engine->TitleWindow("VMware vSphere Client");
+		Engine->TitleWindow("Okcu Hilesi");
+		Engine->TitleWindow("MyPacketTool");*/
+		Sleep(30000);
+	}
+	VIRTUALIZER_END
+}
+
+extern HANDLE myMutex;
+
+extern NOTIFYICONDATA nid;
+
+void __declspec(naked) hkEndGame()
+{
+	__asm {
+		pushad
+		pushfd
+	}
+	Shell_NotifyIcon(NIM_DELETE, &nid);
+	Engine->render = false;
+	if (myMutex)
+	{
+		ReleaseMutex(myMutex);
+	}
+	TerminateProcess(GetCurrentProcess(), 1);
+	__asm {
+		popfd
+		popad
+		call KO_CALL_END_GAME
+		mov edx, KO_FNC_END_GAME
+		add edx, 5
+		jmp edx
+	}
+}
+//22.12.2020 Semih tarafindan asm ile exedeki kontrolü devre dýþý býrakýp istediðimiz zonelerde actýrabiliyoruz asagida zoneid else if diyerek
+//ekstra baska zonelerdede acýlabilir
+DWORD zoneID = 0;
+DWORD kontrolAdresi = 0x00551A8E;  // 2369
+DWORD rankiAc = 0x00551AA3;  // 2369
+
+void __declspec(naked) hkRank()
+{
+	__asm
+	{
+		mov eax, [ECX +0xCE8] // 2369
+		mov zoneID, eax
+		pushad
+		pushfd
+	}
+
+	if (zoneID == 91) __asm jmp rankiActir;
+	//else if (zoneID == 91) __asm jmp rankiActir;  // Örnek 
+	__asm {
+		popfd
+		popad
+		mov edx, kontrolAdresi
+		add edx, 6
+		jmp edx
+		rankiActir:
+		popfd
+		popad
+		jmp rankiAc
+	}
+}
+
+// Anti afk ve kafaya yazý (semih)
+DWORD fncScanZ = 0x57F428,/* 0x00563B8E,*/ keepZ = fncScanZ + 5, retNopZ = fncScanZ + 0x41; //2369
+DWORD fncScanB = 0x57EB5D,/* 0x00563489,*/ keepB = fncScanB + 5, retNopB = fncScanB + 0x38; //2369
+std::string objTMPString = "";
+void SetInfoString(DWORD obj, std::string text, DWORD color, DWORD fontStyle)
+{
+	objTMPString = text + " ";
+	DWORD b = obj;
+	__asm {
+		push color
+		push offset objTMPString
+		mov ecx, b
+		call KO_FNC_SET_INFO_STRING
+	}
+}
+
+bool __fastcall IsAntiAFK(DWORD mobBase)
+{
+	if (!mobBase) return false;
+
+	uint16 protoID = *(uint16*)(mobBase + KO_SSID);
+
+	return std::find(antiAFKProto.begin(), antiAFKProto.end(), protoID) != antiAFKProto.end();
+}
+
+DWORD tBase = 0;
+void __declspec(naked) hkZ()
+{
+	__asm {
+		call orgCall
+
+		pushad
+		pushfd
+		mov ecx, esi
+		call IsAntiAFK
+		movzx eax, al
+		test eax, eax
+		jne antiafkZ
+		popfd
+		popad
+		mov byte ptr ds : [0x57F440], 0x75
+		jmp keepZ
+		antiafkZ :
+
+			popfd
+			popad
+			/*fstp dword ptr[esp + 0x14]
+			fld dword ptr[esp + 0x14]
+			fld dword ptr[esp + 0x10]
+			
+			fnstsw ax
+			test ah,41
+			fstp st(0)*/
+			//jmp retNopZ
+			mov byte ptr ds:[0x57F440],0xEB
+			jmp keepZ
+	}
+}
+
+void __declspec(naked) hkB()
+{
+	__asm {
+		call orgCall
+		pushad
+		pushfd
+		mov ecx, esi
+		call IsAntiAFK
+		movzx eax, al
+		test eax, eax
+		jne antiafkB
+		popfd
+		popad
+		mov byte ptr ds:[0x57EB75], 0x75
+		jmp keepB
+		antiafkB :
+		popfd
+		popad
+		//jmp retNopB
+		mov byte ptr ds:[0x57EB75],0xEB
+		jmp keepB
+	}
+}
+
+void __declspec(naked) hkGenieSelect()
+{
+	__asm {
+		call KO_FNC_GENIE_SELECT_ORG_CALL
+		pushad
+		pushfd
+		mov ecx, eax
+		call IsAntiAFK
+		movzx eax, al
+		test eax, eax
+		jne antiafkB
+		popfd
+		popad
+		jmp KO_FNC_GENIE_SELECT_RET
+		antiafkB :
+		popfd
+			popad
+			xor eax, eax
+			jmp KO_FNC_GENIE_SELECT_RET
+	}
+}
+DWORD GetLevelColor(int diff)
+{
+	if (diff > 5)
+		return 0xFF1DDB16;
+	if (diff < -5)
+		return diff < -10 ? 0xFFFF0000 : 0xFFFF9436;
+	return 0xFFEAEAEA;
+}
+
+extern std::string GetName(DWORD obj);
+
+void Kalinlastir(DWORD obj)
+{
+	//if(obj) SetNameString(obj, GetName(obj), *(DWORD*)(obj + 0x6A0), 0);   //Nick kalýnlaþtýrma
+}
+
+
+void __fastcall Object_Mob_Callback(DWORD obj)
+{
+	if (!obj) return;
+	uint16 protoID = *(uint16*)(obj + KO_SSID);
+	string MobID = "";
+	uint8 authority = *(uint8*)(*(DWORD*)KO_PTR_CHR + KO_WH);
+	int16 id = *(int16*)(obj + KO_OFF_ID);
+	uint8 nation = *(uint8*)(obj + KO_OFF_NATION);
+
+
+	//printf("\n protoID = %d, aut = %d,id = %d,nation = %d", protoID, authority, id, nation);
+	Kalinlastir(obj);
+
+	if (id < 10000)
+		return;
+
+	//printf("Name : %s , Nation : %d\n", GetName(obj).c_str(), nation);
+
+	uint8 myLvl = *(uint8*)(*(DWORD*)KO_PTR_CHR + KO_OFF_LEVEL);
+	uint8 lvl = *(uint8*)(obj + KO_OFF_LEVEL);
+	DWORD color = GetLevelColor(myLvl - lvl);
+	std::string name = GetName(obj);
+
+	if(IsAntiAFK(obj))
+		SetInfoString(obj, xorstr("Manuel Select"), D3DCOLOR_ARGB(255, 255, 255, 0), 0);
+	if (authority == 0 )
+	{
+		if (nation != 0 && protoID != 19067 && protoID != 19068 && protoID != 19069 && protoID != 19070 && protoID != 19071 && protoID != 19072)
+			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", *(DWORD*)(obj + 0x738), 0);
+
+		if (IsAntiAFK(obj))
+		{
+			MobID = string_format("Manuel Select [ID : %d]", protoID);
+		}
+		else
+		{
+			MobID = string_format("[ID : %d]", protoID);
+		}
+
+		SetInfoString(obj, MobID, D3DCOLOR_ARGB(255, 0, 255, 0), 0);
+	}
+	// obj = mob base	
+	
+}
+bool isGM = false;
+
+struct PartyUser {
+	USHORT Id;
+	USHORT Hp;
+	USHORT MaxHp;
+	USHORT Mp;
+	USHORT MaxMp;
+	USHORT Class;
+	USHORT Level;
+	bool Curse;
+	bool Disease;
+};
+
+vector<PartyUser> partyMember;
+bool partyInit = false;
+bool amIInParty = false;
+bool waitingForParty = false;
+
+void __fastcall Object_Player_Callback(DWORD obj)
+{
+	if (!obj) return;
+
+	uint8 authority = *(uint8*)(obj + KO_WH);
+	uint8 Level = *(uint8*)(obj + KO_OFF_LEVEL);
+	int16 id = *(int16*)(obj + KO_OFF_ID);
+	uint8 nation = *(uint8*)(obj + KO_OFF_NATION);
+	uint8 nationm = *(uint8*)(*(DWORD*)KO_PTR_CHR + KO_OFF_NATION);
+
+	Kalinlastir(obj);
+
+	if (id > 10000)
+		return;
+
+	bool changeit = false;
+
+	bool isInMyParty = false;
+
+	if (amIInParty)
+	{
+		for (auto it : partyMember) if (it.Id == id) {
+			isInMyParty = true;
+			break;
+		}
+	}
+
+	//bool dusmanMi = nation != nationm;
+
+	//if (Level < 30) {
+	//	if (isInMyParty)
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 255, 255, 0), 0); //party sari
+	//	else
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 255, 255, 255), 0); //civciv beyaz
+	//}
+	//if (Level >= 30) {
+	//	if(isInMyParty)
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 255, 255, 0), 0); //party sari
+	//	else if (dusmanMi)
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 255, 128, 128), 0); //karsi irk kirmizi
+	//	else if (!dusmanMi)		
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 128, 128, 255), 0); //kendi irkindan olanlarýn koyu mavisi
+	//}
+
+	//if (GetName(obj) == GetName(*(DWORD*)KO_PTR_CHR) && Level >= 30)
+	//{
+	//	if (isInMyParty)
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 255, 255, 0), 0); //party sari
+	//	else
+	//		SetNameString(obj, GetName(obj), D3DCOLOR_ARGB(255, 100, 210, 255), 0); //kendi nickim açýk mavi
+	//}
+
+	//if (*(uint8*)(*(DWORD*)KO_PTR_CHR + KO_WH) == 0)
+	//{
+	//	if (Level < 30) {
+	//		if (isInMyParty)
+	//			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", D3DCOLOR_ARGB(255, 255, 255, 0), 0); //party sari
+	//		else
+	//			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", D3DCOLOR_ARGB(255, 255, 255, 255), 0); //civciv beyaz
+	//	}
+	//	if (Level >= 30) {
+	//		if (isInMyParty)
+	//			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", D3DCOLOR_ARGB(255, 255, 255, 0), 0); //party sari
+	//		else if (dusmanMi)
+	//			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", D3DCOLOR_ARGB(255, 255, 128, 128), 0); //karsi irk kirmizi
+	//		else if (!dusmanMi)
+	//			SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", D3DCOLOR_ARGB(255, 128, 128, 255), 0); //kendi irkindan olanlarýn koyu mavisi
+	//	}
+
+	//		SetNameString(obj, GetName(obj) + " (" + to_string(*(uint8*)(obj + KO_OFF_LEVEL)) + ")", *(DWORD*)(obj + 0x6A0), 0);
+	//}
+
+	Engine->tagLock.lock();
+	auto itr = Engine->tagList.find(id);
+	if (itr != Engine->tagList.end())
+	{
+		tagName tag = itr->second;
+		if (tag.tag.length() > 1) SetInfoString(obj, tag.tag, D3DCOLOR_ARGB(255, tag.r, tag.g, tag.b), 0);
+	}
+	Engine->tagLock.unlock();
+
+	switch (authority)
+	{
+	case 0:
+		SetInfoString(obj, xorstr("<Developer>"), D3DCOLOR_ARGB(255, 255, 64, 89), 0);
+		break;
+	//case 3:
+	//	SetInfoString(obj, xorstr("<CSW Owner>"), D3DCOLOR_ARGB(255, 255, 64, 89), 1);
+	//	break;
+	//case 4:
+	//	SetInfoString(obj, xorstr("<Sponsored Streamer>"), D3DCOLOR_ARGB(255, 255, 64, 89), 1);
+	//	break;
+	}
+	
+}
+
+void __declspec(naked) hkObjectMobLoop()
+{
+	__asm {
+		mov eax, [ecx]
+		mov edx, [eax + 0xC]
+		pushad
+		pushfd
+		call Object_Mob_Callback
+		popfd
+		popad
+		jmp KO_FNC_OBJECT_MOB_LOOP_RET
+	}
+}
+
+void __declspec(naked) hkObjectPlayerLoop()
+{
+	__asm {
+		mov edx, [esi]
+		mov edx, [edx + 0x18]
+		pushad
+		pushfd
+		mov ecx, esi
+		call Object_Player_Callback
+		popfd
+		popad
+		jmp KO_FNC_OBJECT_PLAYER_LOOP_RET
+	}
+}
+
+// KO Tick fonksiyonu (sürekli çalýþýr)
+const DWORD KO_GAME_TICK = 0x411740;// 0x00410C10;
+DWORD TICK_ORG = 0;
+
+
+const DWORD OFF_PT = 0x32C;
+const DWORD OFF_PTCOUNT = 0x330;
+const DWORD OFF_PTBASE = 0x1E8;
+
+__inline DWORD RDWORD(DWORD ulBase)
+{
+	if (!IsBadReadPtr((VOID*)ulBase, sizeof(DWORD)))
+	{
+		return(*(DWORD*)(ulBase));
+	}
+	return 0;
+}
+
+const WORD KO_OFF_INV1 = 0x1B8;
+const WORD KO_OFF_INV2 = 0x228;
+
+DWORD InvItemId(int slot) {
+	DWORD ID = RDWORD(RDWORD(RDWORD(RDWORD(RDWORD(KO_DLG) + KO_OFF_INV1) + KO_OFF_INV2 + (4 * slot)) + 0x68));
+	DWORD EXT = RDWORD(RDWORD(RDWORD(RDWORD(RDWORD(KO_DLG) + KO_OFF_INV1) + KO_OFF_INV2 + (4 * slot)) + 0x6C));
+	DWORD id = ID + EXT;
+	return id;
+}
+
+bool HasItem(DWORD itemid) {
+	if (!IsDebuggerPresent())
+	{
+		for (int x = 14; x < 42; x++) if (InvItemId(x) == itemid) return true;
+	}
+	return false;
+}
+
+time_t arrowKontrol = 0;
+time_t timeLapse = 0, guardCheck = 0;
+
+
+
+std::map<uint32, CSpell*> archerSpells;
+
+
+extern TABLE_MOB* GetMobBase(DWORD MobID);
+
+extern DWORD GetTarget();
+
+typedef char(__thiscall* tsub_763350)(DWORD ecx, int a2, int a3, int a4, int a5, int a6);
+tsub_763350 sub_763350 = (tsub_763350)0x763350;
+
+bool isChicken = false;
+
+void __fastcall civcivVer()
+{
+
+}
+
+void __declspec(naked) hkRankImage()
+{
+	__asm {
+		mov al, isChicken
+		movzx eax, al
+		test eax, eax
+
+
+		civcivle:
+
+	}
+}
+bool InifinityArrow = false;
+
+void __fastcall myTick()
+{
+	if (timeLapse > clock() - 30)
+		return;
+
+	timeLapse = clock();
+
+	if (guardCheck < clock() - 200)
+	{
+		guardCheck = clock();
+		if (!Engine->fncGuard.Check()) {
+			
+			raise(SIGSEGV);
+		}
+	}
+
+	/*if (GetAsyncKeyState(VK_F1))
+	{
+		sub_763350(*(DWORD*)0x00E47898, 0, 31, 0, 0, 0);
+		printf("t\n");
+	}*/
+
+	if (DWORD target = GetTarget()) {
+		if (*(uint16*)(target + KO_OFF_ID) >= 10000) {
+			uint8 myLvl = *(uint8*)(*(DWORD*)KO_PTR_CHR + KO_OFF_LEVEL);
+			uint8 lvl = *(uint8*)(target + KO_OFF_LEVEL);
+			uint8 nation = *(uint8*)(target + KO_OFF_NATION);
+			uint16 protoID = *(uint16*)(target + KO_SSID);
+			DWORD color = GetLevelColor(myLvl - lvl);
+			std::string name = GetName(target);
+			if (Engine->uiTargetBar && nation == 0 
+				&& protoID != 19067 && protoID != 19068 && protoID != 19069 && protoID != 19070 && protoID != 19071 && protoID != 19072) 
+				Engine->uiTargetBar->SetInfo(color, lvl, name);
+		}
+	}
+
+	if (!partyInit)
+	{
+		PartyUser mem;
+		mem.Id = 0;
+		mem.Hp = 0;
+		mem.MaxHp = 0;
+		mem.Mp = 0;
+		mem.MaxMp = 0;
+		mem.Class = 0;
+		mem.Level = 0;
+		mem.Curse = false;
+		mem.Disease = false;
+		for (uint8 i = 0; i < 8; i++) partyMember.push_back(mem);
+		partyInit = true;
+
+		for (uint32 i = 101001; i <= 610159; i++)
+		{
+			CSpell* spell = GetSkillBase(i);
+			if (spell && spell->dwNeedItem == 391010000) archerSpells.insert({ spell->dwID, spell });
+		}
+	}
+	//animasyon start
+	if (*(DWORD*)KO_PTR_CHR) 
+	{
+		DWORD chr = *(DWORD*)KO_PTR_CHR + KO_OFF_N3CHR;
+
+		if(Engine->m_PlayerBase) Engine->m_PlayerBase->m_iZoneID = *(uint8*)(*(DWORD*)KO_PTR_CHR + KO_OFF_ZONE);
+
+
+		if (chr) {
+			__ChrAniCurSet(chr, *(int*)(*(DWORD*)KO_PTR_CHR + KO_OFF_ANIM_ID), false, 1.175494351e-38F, 0, true);
+		}
+
+
+		for (auto a : Engine->privatemessages)
+			a->Tick();
+
+		return;
+	//animasyon end----------------------------------
+
+		DWORD base = RDWORD(RDWORD(KO_DLG) + OFF_PTBASE);
+		DWORD buffer = RDWORD(base + OFF_PT);
+		DWORD partyCount = RDWORD(base + OFF_PTCOUNT);
+		
+		amIInParty = partyCount > 1;
+		waitingForParty = partyCount > 0;
+
+		for (int i = 0; i < 8; i++)
+		{
+			partyMember[i].Id = 0;
+			partyMember[i].Hp = 0;
+			partyMember[i].MaxHp = 0;
+			partyMember[i].Mp = 0;
+			partyMember[i].MaxMp = 0;
+			partyMember[i].Class = 0;
+			partyMember[i].Level = 0;
+			partyMember[i].Curse = false;
+			partyMember[i].Disease = false;
+		}
+
+		for (int i = 0; i < partyCount; i++) {
+			if (partyCount > 0) {
+				buffer = RDWORD(buffer);
+				if (buffer) {
+					partyMember[i].Id = *(USHORT*)(buffer + 0x8);
+					partyMember[i].Level = *(USHORT*)(buffer + 0xC);
+					partyMember[i].Class = *(USHORT*)(buffer + 0x10);
+					partyMember[i].Hp = *(USHORT*)(buffer + 0x18);
+					partyMember[i].MaxHp = *(USHORT*)(buffer + 0x1C);
+					partyMember[i].Mp = *(USHORT*)(buffer + 0x20);
+					partyMember[i].MaxMp = *(USHORT*)(buffer + 0x24);
+					partyMember[i].Curse = *(bool*)(buffer + 0x28);
+					partyMember[i].Disease = *(bool*)(buffer + 0x29);
+				}
+			}
+		}
+
+		 //infinity arrow
+		if (arrowKontrol < clock() - 2000)
+		{
+			arrowKontrol = clock();
+
+			if (HasItem(800606000))
+			{
+				auto itr = archerSpells.begin();
+				if (itr != archerSpells.end() && itr->second->dwNeedItem == 391010000) {
+					while (itr != archerSpells.end())
+					{
+						itr->second->dwNeedItem = 0;
+						auto itcrc = Engine->skillcrc.find(itr->second->dwID + 2031);
+						if (itcrc != Engine->skillcrc.end()) {
+							SpellCRC crc(crc32((uint8*)(DWORD)itr->second, 0xA8, -1), crc32((uint8*)((DWORD)itr->second + 0xB4), 0x2C, -1));
+							itcrc->second = crc;
+						}
+						++itr;
+					}
+				}
+			}
+			else {
+				auto itr = archerSpells.begin();
+				if (itr != archerSpells.end() && itr->second->dwNeedItem == 0) {
+					while (itr != archerSpells.end())
+					{
+						itr->second->dwNeedItem = 391010000;
+						auto itcrc = Engine->skillcrc.find(itr->second->dwID + 2031);
+						if (itcrc != Engine->skillcrc.end()) {
+							SpellCRC crc(crc32((uint8*)(DWORD)itr->second, 0xA8, -1), crc32((uint8*)((DWORD)itr->second + 0xB4), 0x2C, -1));
+							itcrc->second = crc;
+						}
+						++itr;
+					}
+				}
+			}
+		}
+
+	
+	} 
+}
+
+DWORD __declspec(naked) hkTick()
+{
+	__asm {
+		pushad
+		pushfd
+		call myTick
+		popfd
+		popad
+		jmp TICK_ORG
+	}
+}
+
+DWORD rtOrg = 0;
+DWORD rTmp = 0;
+
+DWORD __declspec(naked) hkSetFontString()
+{
+	__asm {
+		pushad
+		pushfd
+		mov rTmp, ecx
+	}
+	if (RDWORD(rTmp + 0x1C) == 0)
+	{
+		__asm {
+			popfd
+			popad
+			xor eax, eax
+			ret 8
+		}
+	}
+	__asm {
+		popfd
+		popad
+		jmp rtOrg
+	}
+}
+
+//minimap ayarlarý
+const int upY = -48;
+const int upX = 15;
+
+void __declspec(naked) hkMinimapPos()
+{
+	__asm {
+		add edx, upY
+		add eax, upX
+		push edx
+		push eax
+		mov eax, [ESI + 0x2C]
+		call eax
+		pop edi
+		pop esi
+		pop ebp
+		pop ebx
+		add esp, 0x38
+		ret
+	}
+}
+
+DWORD WINAPI PearlEngine::EngineMain(PearlEngine * e)
+{
+	//rtOrg = (DWORD)DetourFunction((PBYTE)KO_UIF_SET_FONT_STRING, (PBYTE)hkSetFontString);
+	//TICK_ORG = (DWORD)DetourFunction((PBYTE)KO_GAME_TICK, (PBYTE)hkTick);
+
+	// slide görüntü bugu fix
+	*(float*)0x00C55CF0 = 0.5f;
+
+	memcpy((void*)0x43342B, (char*)"\xE9\x34\x1\x0\x0\x90", 6); // Animasyon patlamasý fix
+
+	// Discord yükleme
+	if (e->dc = new Discord) {
+		e->dc->Initialize();
+		e->dc->Update();
+	}
+
+	// Anti afk ve kafaya yazý yazma
+	DetourFunction((PBYTE)KO_FNC_OBJECT_MOB_LOOP, (PBYTE)hkObjectMobLoop);
+	DetourFunction((PBYTE)KO_FNC_OBJECT_PLAYER_LOOP, (PBYTE)hkObjectPlayerLoop);
+	DetourFunction((PBYTE)fncScanZ, (PBYTE)hkZ);
+	DetourFunction((PBYTE)fncScanB, (PBYTE)hkB);
+	DetourFunction((PBYTE)KO_FNC_GENIE_SCAN, (PBYTE)hkGenieSelect);
+
+	DetourFunction((PBYTE)kontrolAdresi, (PBYTE)hkRank);   // Zindanwar Rank 
+
+	DetourFunction((PBYTE)Func_RangeInstance, (PBYTE)hkRangeInstance); //mage alan kýsýtlama  
+	DetourFunction((PBYTE)Func_AreaMove, (PBYTE)hkAreaMove); //mage alan kýsýtlama
+
+	oShellExecuteA = (tShellExecuteA)DetourFunction((PBYTE)ShellExecuteA, (PBYTE)hkShellExecuteA);
+	DetourFunction((PBYTE)KO_FNC_END_GAME, (PBYTE)hkEndGame);
+
+	oGetChild = (tGetChild)DetourFunction((PBYTE)KO_GET_CHILD_BY_ID_FUNC, (PBYTE)GetChildByID_Hook);
+	//DetourFunction((PBYTE)KO_GET_CHILD_BY_ID_FUNC, (PBYTE)GetChildByID_Hook2);
+
+
+	e->ScanThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)DriverScan, NULL, NULL, NULL);
+	e->AliveThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)AliveSend, NULL, NULL, NULL);
+	e->SuspendThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)SuspendCheck, e, NULL, NULL);
+	e->LisansThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)LicenseEngine, e, NULL, NULL);
+	e->TitleThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)TitleCheck, e, NULL, NULL);
+
+	e->m_bCheckSleep = GetTickCount();
+	e->m_LoginPlugInjected = true;
+	while (true)
+	{
+		e->Update();
+
+		//if (IsDebuggerPresent())
+		//	e->Shutdown(xorstr("Debugger"));  // Debugger Tespit Ediyor.
+
+		//if (e->IsHWBreakpointExists())
+		//	e->Shutdown(xorstr("BreakPoint"));   // Breakpoint Tespit Ediyor.
+
+		//if (e->IsitaSandBox())
+		//	e->Shutdown(xorstr("Sandbox"));	// Sanal Makineyi Tespit Ediyor.
+
+		//if (WaitForSingleObject(e->ScanThread, 1) == WAIT_OBJECT_0
+		//	|| WaitForSingleObject(e->SuspendThread, 1) == WAIT_OBJECT_0
+		//	|| WaitForSingleObject(e->LisansThread, 1) == WAIT_OBJECT_0)
+		//	Engine->Shutdown(xorstr("All the pieces of the game can't work together."));
+
+		Sleep(100);
+	}
+
+	return TRUE;
+}
+
+void PearlEngine::Update() 
+{
+	if (!m_bSelectedCharacter)
+	{
+		//printf("1 \n");
+		return;
+	}
+
+	if (!m_bGameStart)
+	{
+		//printf("2 \n");
+		return;
+	}
+	
+	if (!isAlive)
+		return;
+
+	if (thisProc == NULL) 
+		thisProc = GetCurrentProcess();
+		
+	if (KO_ADR == 0x0)
+		KO_ADR = *(DWORD*)KO_PTR_CHR;
+
+	uint8 Authority;
+	Authority = *(uint8*)(KO_ADR + KO_WH);
+	if (this->Player.Authority != Authority)
+	{
+		if (Authority == USER || Authority == GAMEMASTER || Authority == BANNED)
+		{
+			tmpGraphics = "";
+			for (string gpu : Player.GPU)
+				tmpGraphics += xorstr(" | ") + gpu;
+
+			this->Player.Authority = (UserAuthority)Authority;
+
+			Packet result(XSafe);
+			result << uint8_t(XSafeOpCodes::AUTHINFO) << Authority << tmpGraphics << Player.CPU;
+			this->Send(&result);
+
+			if (Authority != 0 && Authority != 1 && Authority != 2 && Authority != 11 && Authority != 12 && Authority != 250 && Authority != 255)
+			{
+				Shutdown(xorstr("Game closed due to memory editing"));
+			}
+		}
+	}
+
+	if (m_PlayerBase == NULL)
+		m_PlayerBase = new CPlayerBase();
+
+	if (m_PlayerBase != NULL)
+		m_PlayerBase->UpdateFromMemory();
+}
+
+DWORD Read4Bytes(DWORD paddy) 
+{
+	return *(int*)paddy;
+}
+
+void __stdcall LM_Shutdown(std::string log, std::string graphicCards, std::string processor) 
+{
+	if (isAlive && gameStarted) 
+	{
+		Packet result(XSafe);
+		result << uint8_t(XSafeOpCodes::LOG) << log << graphicCards << processor;
+		LM_Send(&result);
+	}
+	Shutdown(log);
+}
+
+void PearlEngine::Shutdown(std::string log) 
+{
+	tmpGraphics = "";
+	for (string gpu : Player.GPU)
+		tmpGraphics += xorstr(" | ") + gpu;
+	LM_Shutdown(log, tmpGraphics, Player.CPU);
+}
+
+void LM_Send(Packet * pkt) 
+{
+	if (isAlive) 
+	{
+		uint8 opcode = pkt->GetOpcode();
+		uint8 * out_stream = nullptr;
+		uint16 len = (uint16)(pkt->size() + 1);
+
+		out_stream = new uint8[len];
+		out_stream[0] = pkt->GetOpcode();
+
+		if (pkt->size() > 0)
+			memcpy(&out_stream[1], pkt->contents(), pkt->size());
+
+		BYTE* ptrPacket = out_stream;
+		SIZE_T tsize = len;
+
+		__asm
+		{
+			mov ecx, KO_PTR_PKT
+			mov ecx, DWORD ptr ds : [ecx]
+			push tsize
+			push ptrPacket
+			call KO_SND_FNC
+		}
+
+		delete[] out_stream;
+	}
+}
+
+bool dirExists(const std::string& dirName_in)
+{
+	DWORD ftyp = GetFileAttributesA(dirName_in.c_str());
+	if (ftyp == INVALID_FILE_ATTRIBUTES)
+		return false;
+
+	if (ftyp & FILE_ATTRIBUTE_DIRECTORY)
+		return true;
+
+	return false;
+}
+
+std::string getHWID() 
+{
+	HW_PROFILE_INFO hwProfileInfo;
+	GetCurrentHwProfile(&hwProfileInfo);
+	string hwidWString = hwProfileInfo.szHwProfileGuid;
+	string hwid(hwidWString.begin(), hwidWString.end());
+	return hwid;
+}
+
+void GetMacHash(uint16& MACOffset1, uint16& MACOffset2);
+uint16 GetCPUHash();
+
+uint16 GetVolumeHash()
+{
+	DWORD SerialNum = 0;
+	GetVolumeInformationA(xorstr("C:\\"), NULL, 0, &SerialNum, NULL, NULL, NULL, 0);
+	uint16 nHash = (uint16)((SerialNum + (SerialNum >> 16)) & 0xFFFF);
+	return nHash;
+}
+
+int64 GetHardwareID()
+{
+	uint16 MACData1, MACData2 = 0;
+	GetMacHash(MACData1, MACData2);
+	return _atoi64(string_format(xorstr("%d%d%d"), MACData1, MACData2, GetCPUHash()).c_str());/*, GetVolumeHash()).c_str());*/ //09.10.2020 GetVolumaHash Kapatýldý
+	//Deger Uzun gelirse sýkýntý yaratabilirdi oyuncu oyuna giremeyebilirdi o sebeple kapatýldý
+}
+
+uint16 HashMacAddress(PIP_ADAPTER_INFO info)
+{
+	uint16 nHash = 0;
+	for (uint32 i = 0; i < info->AddressLength; i++)
+		nHash += (info->Address[i] << ((i & 1) * 8));
+	return nHash;
+}
+
+void GetMacHash(uint16& MACOffset1, uint16& MACOffset2)
+{
+	IP_ADAPTER_INFO AdapterInfo[32];
+	DWORD dwBufLen = sizeof(AdapterInfo);
+
+	DWORD dwStatus = GetAdaptersInfo(AdapterInfo, &dwBufLen);
+	if (dwStatus != ERROR_SUCCESS)
+		return;
+
+	PIP_ADAPTER_INFO pAdapterInfo = AdapterInfo;
+	MACOffset1 = HashMacAddress(pAdapterInfo);
+	if (pAdapterInfo->Next)
+		MACOffset2 = HashMacAddress(pAdapterInfo->Next);
+
+	if (MACOffset1 > MACOffset2)
+	{
+		uint16 TempOffset = MACOffset2;
+		MACOffset2 = MACOffset1;
+		MACOffset1 = TempOffset;
+	}
+}
+
+uint16 GetCPUHash()
+{
+	int CPUInfo[4] = { 0, 0, 0, 0 };
+	__cpuid(CPUInfo, 0);
+	uint16 nHash = 0;
+	uint16* nPointer = (uint16*)(&CPUInfo[0]);
+	for (uint16 i = 0; i < 8; i++)
+		nHash += nPointer[i];
+
+	return nHash;
+}
+
+// genie hook
+const DWORD genieAddress = 0x009294CF;
+float genieBeklemeSuresi = 1.6f;
+
+DWORD __declspec(naked) hkGenie()
+{/*
+	if (Engine->m_PlayerBase->isWarrior())
+		genieBeklemeSuresi = 1.6f;
+	else if (Engine->m_PlayerBase->isRogue())
+		genieBeklemeSuresi = 1.6f;
+	else if (Engine->m_PlayerBase->isMage())
+		genieBeklemeSuresi = 1.6f;
+	else if (Engine->m_PlayerBase->isPriest())
+		genieBeklemeSuresi = 1.6f;*/
+
+	__asm {
+		fld genieBeklemeSuresi
+		fadd
+		mov eax, genieAddress
+		add eax, 6
+		push eax
+		ret
+	}
+}
+// genie hook sonu
+
+void ASMPatch(DWORD dst, char* src, int size)
+{
+	DWORD oldprotect;
+	VirtualProtect((LPVOID)dst, size, PAGE_EXECUTE_READWRITE, &oldprotect);
+	memcpy((LPVOID)dst, src, size);
+	VirtualProtect((LPVOID)dst, size, oldprotect, &oldprotect);
+}
+
+void StartHook()
+{
+	if (Engine->m_bHookStart) return;
+
+	//DWORD genieadresi = 0x009294CF; //   DC05 E806B900    FADD QWORD PTR DS:[B906E8]
+
+	//DWORD genieNewCD = (DWORD)malloc(sizeof(float));
+	//ASMPatch(genieadresi, (char*)"\xD8\x05", 2);
+	//*(float*)genieNewCD = 0.5f;
+
+	//if (Engine->m_PlayerBase->isWarrior())
+	//	genieBeklemeSuresi = 1.6f;
+	//else if (Engine->m_PlayerBase->isRogue())
+	//	genieBeklemeSuresi = 1.6f;
+	//else if (Engine->m_PlayerBase->isMage())
+	//	genieBeklemeSuresi = 1.6f;
+	//else if (Engine->m_PlayerBase->isPriest())
+	//	genieBeklemeSuresi = 1.6f;
+	
+	//*(DWORD*)(genieadresi + 2) = genieNewCD;
+
+	//DetourFunction((PBYTE)genieAddress, (PBYTE)hkGenie); // genie hookla
+	Engine->InitCameraZoom();
+	Engine->m_SettingsMgr = new CSettingsManager();
+	Engine->m_SettingsMgr->Init();
+	Engine->m_PlayerBase = new CPlayerBase();
+	
+	//Plugins
+	Engine->uiState = new CUIStatePlug();
+	Engine->uiTargetBar = new CUITargetBarPlug();
+	Engine->uiTaskbarMain = new CUITaskbarMainPlug();
+	//Engine->uiTaskbarSub = new CUITaskbarSubPlug();
+	Engine->uiClanWindowPlug = new CUIClanWindowPlug();
+	//Engine->uiMiniMenuPlug = new CUIMiniMenuPlug();
+	Engine->uiGenieSubPlug = new CUIGenieSubPlug();
+	Engine->uiSeedHelperPlug = new CUISeedHelperPlug();
+	//Engine->uiSchedularPlug = new CUISchedular;
+	Engine->uiPieceChangePlug = new CUIPieceChangePlug();
+	Engine->uiTradePrice = new CUITradePricePlug();
+	Engine->uiTradeInventory = new CUITradeInventoryPlug();
+	Engine->uiTradeItemDisplay = new CUITradeItemDiplayPlug();
+	Engine->uiTradeItemDisplaySpecial = new CUITradeItemDisplaySpecialPlug();
+	Engine->m_MerchantMgr = new CMerchantManager();
+	//Engine->uiAnvil = new CUIAnvil();
+	////Engine->uiToolTip = new CUITooltip(); //kullanýlmýyor	
+	Engine->uiInventoryPlug = new CUIInventoryPlug();
+	Engine->uiPartyBBS = new CUIPartyBBSPlug();
+	Engine->uiHPBarPlug = new CUIHPBarPlug();
+	Engine->uiTopRightNewPlug = new CUITopRightNewPlug();
+	//Engine->uiMinimapPlug = new CUIMinimapPlug;
+	Engine->uiInformationWind = new CUIInformationWindPlug();
+	////Engine->uiEventNotice = new CUIEventNoticePlug(); //kullanýlmýyor
+	Engine->uiScoreBoard = new CUIScoreBoardPlug();
+
+	Engine->m_bHookStart = true;
+	Engine->m_UiMgr->OpenMerchantNotice();
+
+	//Engine->m_UiMgr->uiCollectionRace->OpenCR();
+	//Engine->m_UiMgr->uiCollectionRace->SetVisible(false);
+}
+
+enum CollectionRaceType
+{
+	CRStartRecv,
+	CRGetActiveTime,
+	CRMonsterKilled,
+	CRUpdateCounter,
+	CRFinishRecv,
+	CRHide
+};
+
+void CollectionRaceStart(Packet & pkt);
+void CollectionRaceGetActiveTime(Packet & pkt);
+void CollectionRaceHide();
+void CollectionRaceDead(Packet & pkt);
+void CollectionRaceUpdateCounter(Packet & pkt);
+void CollectionRaceFinish();
+
+void HandleCollectionRace(Packet & pkt)
+{
+	uint8 OpCode;
+	pkt >> OpCode;
+
+	switch (OpCode)
+	{
+	case CollectionRaceType::CRStartRecv:
+		CollectionRaceStart(pkt);
+		break;
+	case CollectionRaceType::CRGetActiveTime:
+		CollectionRaceGetActiveTime(pkt);
+		break;
+	case CollectionRaceType::CRMonsterKilled:
+		CollectionRaceDead(pkt);
+		break;
+	case CollectionRaceType::CRUpdateCounter:
+		CollectionRaceUpdateCounter(pkt);
+		break;
+	case CollectionRaceType::CRFinishRecv:
+		CollectionRaceFinish();
+		break;
+	case CollectionRaceType::CRHide:
+		CollectionRaceHide();
+		break;
+	default:
+		break;
+	}
+}
+
+void CollectionRaceStart(Packet & pkt)
+{
+	//Engine->m_UiMgr->uiCollectionRace = NULL;
+
+	Engine->IsCRActive = true;
+	for (int i = 0; i < 3; i++) 
+	{
+		pkt >> Engine->pCollectionRaceEvent.sSid[i] >> Engine->pCollectionRaceEvent.killTarget[i];
+		Engine->pCollectionRaceEvent.killCount[i] = 0;
+	}
+
+	for (int i = 0; i < 3; i++)
+		pkt >> Engine->pCollectionRaceEvent.RewardsItemID[i] >> Engine->pCollectionRaceEvent.RewardsItemCount[i];
+
+	pkt >> Engine->pCollectionRaceEvent.EventTimer >> Engine->pCollectionRaceEvent.TotalParticipantUser >> Engine->pCollectionRaceEvent.Nation;
+	pkt >> Engine->pCollectionRaceEvent.EventName;
+
+	if (Engine->m_UiMgr->uiCollectionRace == NULL)
+	{
+		Engine->m_UiMgr->uiCollectionRace->OpenCR();
+	}
+
+	Engine->m_UiMgr->uiCollectionRace->Start();
+	//if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCollectionRace != NULL)
+	//{
+	//	Engine->m_UiMgr->uiCollectionRace->Open();
+	//	Engine->m_UiMgr->uiCollectionRace->Start();
+	//}
+}
+
+void CollectionRaceGetActiveTime(Packet & pkt)
+{
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCollectionRace != NULL && Engine->m_UiMgr->uiCollectionRace->IsVisible())
+		return;
+
+	Engine->m_UiMgr->uiCollectionRace = NULL;
+
+	Engine->IsCRActive = true;
+
+	uint16 userkillcount = 0;
+	for (int i = 0; i < 3; i++) 
+	{
+		pkt >> Engine->pCollectionRaceEvent.sSid[i] >> Engine->pCollectionRaceEvent.killTarget[i] >> userkillcount;
+		Engine->pCollectionRaceEvent.killCount[i] = userkillcount;
+	}
+
+	for (int i = 0; i < 3; i++)
+		pkt >> Engine->pCollectionRaceEvent.RewardsItemID[i] >> Engine->pCollectionRaceEvent.RewardsItemCount[i];
+
+	pkt >> Engine->pCollectionRaceEvent.EventTimer >> Engine->pCollectionRaceEvent.m_iCompleteUserCount >> Engine->pCollectionRaceEvent.TotalParticipantUser >> Engine->pCollectionRaceEvent.Nation;
+	pkt >> Engine->pCollectionRaceEvent.EventName;
+
+	if (Engine->m_UiMgr->uiCollectionRace == NULL)
+	{
+		Engine->m_UiMgr->uiCollectionRace->OpenCR();
+	}
+
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCollectionRace != NULL)
+	{
+		Engine->m_UiMgr->uiCollectionRace->Open();
+		Engine->m_UiMgr->uiCollectionRace->Start();
+		Engine->m_UiMgr->uiCollectionRace->Update();
+	}
+}
+
+void CollectionRaceHide()
+{
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCollectionRace != NULL)
+		Engine->m_UiMgr->uiCollectionRace->Close();
+}
+
+void CollectionRaceDead(Packet & pkt)
+{
+	if (Engine->m_UiMgr == NULL || Engine->m_UiMgr->uiCollectionRace == NULL)
+		return;
+
+	uint16 MonsterProtoID, UserKillCount[3];
+	pkt >> MonsterProtoID >> UserKillCount[0] >> UserKillCount[1] >> UserKillCount[2];
+	
+	if (Engine->IsCRActive)
+	{
+		bool updateRequired = false;
+		for (int i = 0; i < 3; i++) 
+		{
+			if (Engine->pCollectionRaceEvent.sSid[i] == MonsterProtoID)
+			{
+				if (Engine->pCollectionRaceEvent.killCount[i] < Engine->pCollectionRaceEvent.killTarget[i])
+				{
+					Engine->pCollectionRaceEvent.killCount[i] = UserKillCount[i];
+					updateRequired = true;
+				}
+			}
+		}
+
+		if (updateRequired && Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->uiCollectionRace->Update();
+	}
+}
+
+void CollectionRaceUpdateCounter(Packet & pkt)
+{
+	if (!Engine->IsCRActive || Engine->m_UiMgr == NULL || Engine->m_UiMgr->uiCollectionRace == NULL)
+		return;
+
+	pkt >> Engine->pCollectionRaceEvent.m_iCompleteUserCount >> Engine->pCollectionRaceEvent.TotalParticipantUser;
+
+	Engine->m_UiMgr->uiCollectionRace->UpdateFinishUserCounter();
+}
+
+void CollectionRaceFinish()
+{
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCollectionRace != NULL)
+		Engine->m_UiMgr->uiCollectionRace->SetVisible(false);
+
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiTopLeft != NULL)
+		Engine->m_UiMgr->uiTopLeft->HideCollectionRaceButton();
+
+	for (int i = 0; i < 3; i++)
+	{
+		Engine->pCollectionRaceEvent.sSid[i] = 0;
+		Engine->pCollectionRaceEvent.killTarget[i] = 0;
+		Engine->pCollectionRaceEvent.killCount[i] = 0;
+		Engine->pCollectionRaceEvent.RewardsItemID[i] = 0;
+		Engine->pCollectionRaceEvent.RewardsItemCount[i] = 0;
+	}
+
+	Engine->pCollectionRaceEvent.EventTimer = 0;
+	Engine->pCollectionRaceEvent.m_iCompleteUserCount = Engine->pCollectionRaceEvent.TotalParticipantUser = 0;
+	Engine->pCollectionRaceEvent.EventName = "Collection Race Event";
+
+	Engine->IsCRActive = false;
+
+	Engine->m_UiMgr->uiCollectionRace = NULL;
+}
+
+void HandleCastleSiegeWarTimer(Packet & pkt) 
+{
+	pkt >> Engine->pCastleSiegeWar.SiegeType >> Engine->pCastleSiegeWar.StartTime >> Engine->pCastleSiegeWar.RemainingTime;
+	pkt.SByte();
+	pkt >> Engine->pCastleSiegeWar.SiegeOwnerClanName;
+
+	//if (Engine->m_UiMgr->uiCastleSiegeWarSituation == NULL)
+	if (Engine->uiTopRightNewPlug->BasladimiBaslamadimi == false)
+	{
+		Engine->uiTopRightNewPlug->BasladimiBaslamadimi = true;
+
+		if (Engine->pCastleSiegeWar.SiegeType == 0x01)
+			Engine->isSiegeWarStart = true;
+		
+		if (Engine->pCastleSiegeWar.SiegeType == 0x02) 
+		{
+			Engine->isSiegeWarStart = false;
+			Engine->isSiegeWarActive = true;
+		}
+		//test aktif etme
+		Engine->SetVisible(Engine->uiTopRightNewPlug->m_btnsituation, true);
+		Engine->SetState(Engine->uiTopRightNewPlug->m_btnsituation, UI_STATE_BUTTON_NORMAL);
+		//test
+
+		if (Engine->m_UiMgr->uiCastleSiegeWarTimer == NULL)
+		{
+			Engine->m_UiMgr->uiCastleSiegeWarTimer->OpenCastleSiegeWarTimer();
+		}
+	}
+
+	if (Engine->pCastleSiegeWar.SiegeType == 0x00)
+	{
+		Engine->isSiegeWarStart = false;
+		Engine->isSiegeWarActive = false;
+
+		//test sildirme
+		Engine->uiTopRightNewPlug->BasladimiBaslamadimi = false;
+		if (Engine->uiTopRightNewPlug != NULL)
+		{
+			Engine->SetVisible(Engine->uiTopRightNewPlug->m_btnsituation, false);
+			Engine->SetState(Engine->uiTopRightNewPlug->m_btnsituation, UI_STATE_BUTTON_DISABLE);
+		}
+		//test
+
+		if (Engine->m_UiMgr->uiCastleSiegeWarTimer != NULL)
+		{
+			Engine->m_UiMgr->uiCastleSiegeWarTimer->SetVisible(false);	
+			Engine->m_UiMgr->uiCastleSiegeWarTimer = NULL;
+			delete Engine->m_UiMgr->uiCastleSiegeWarTimer;
+		}
+	}
+
+	if (Engine->m_UiMgr != NULL && Engine->m_UiMgr->uiCastleSiegeWarTimer != NULL && Engine->pCastleSiegeWar.SiegeType == 0x02) 
+		Engine->m_UiMgr->uiCastleSiegeWarTimer->Update();
+}
+
+bool voiceStarted = false;
+
+void ZindanWarFlag(Packet &pkt) {
+	std::string ename, kname;
+	uint16 ekillcount, kkillcount; uint32 remtime;
+	pkt >> ename >> ekillcount >> kname >> kkillcount >> remtime;
+	if (ename.empty() || kname.empty() || !Engine->uiScoreBoard) return;
+
+	if (!Engine->uiScoreBoard->m_Timer) Engine->uiScoreBoard->m_Timer = new CTimer(false);
+
+	Engine->SetString(Engine->uiScoreBoard->Ename, ename);
+	Engine->SetString(Engine->uiScoreBoard->Kname, kname);
+	Engine->SetString(Engine->uiScoreBoard->EScore, std::to_string(ekillcount));
+	Engine->SetString(Engine->uiScoreBoard->KScore, std::to_string(kkillcount));
+	Engine->SetString(Engine->uiScoreBoard->RemTime, std::to_string(remtime));
+	Engine->pzindanwar.start = true;
+	Engine->pzindanwar.remtime = remtime;
+	if (Engine->m_PlayerBase->m_iZoneID == 91) Engine->SetVisible(Engine->uiScoreBoard->m_dVTableAddr, true);
+}
+
+void ZindanWarLogOut() {
+	if (Engine->uiScoreBoard) Engine->SetVisible(Engine->uiScoreBoard->m_dVTableAddr, false);
+	Engine->pzindanwar.Init();
+}
+
+void ZindanWarUpdateScore(Packet &pkt) {
+	uint8 nation; uint16 killcount;
+	pkt >> nation >> killcount;
+	if ((nation != 1 && nation != 2) || !Engine->uiScoreBoard) return;
+	if (nation == 1) Engine->SetString(Engine->uiScoreBoard->KScore, std::to_string(killcount));
+	else Engine->SetString(Engine->uiScoreBoard->EScore, std::to_string(killcount));
+}
+
+enum class ZindanOp { flagsend, updatescore, logout};
+void HandleZindanWar(Packet &pkt) {
+	uint8 subcode = pkt.read<uint8>();
+	switch ((ZindanOp)subcode)
+	{
+	case ZindanOp::flagsend:
+		ZindanWarFlag(pkt);
+		break;
+	case ZindanOp::updatescore:
+		ZindanWarUpdateScore(pkt);
+		break;
+	case ZindanOp::logout:
+		ZindanWarLogOut();
+		break;
+	}
+}
+
+int GetMsSinceMidnightGmt(std::chrono::system_clock::time_point tpNow) {
+	time_t tnow = std::chrono::system_clock::to_time_t(tpNow);
+	tm * tmDate = std::localtime(&tnow);
+	std::chrono::duration<int> durTimezone; // 28800 for HKT
+	// because mktime assumes local timezone, we shift the time now to GMT, then fid mid
+	time_t tmid = std::chrono::system_clock::to_time_t(tpNow - durTimezone);
+	tm * tmMid = std::localtime(&tmid);
+	tmMid->tm_hour = 0;
+	tmMid->tm_min = 0;
+	tmMid->tm_sec = 0;
+	auto tpMid = std::chrono::system_clock::from_time_t(std::mktime(tmMid));
+	auto durSince = tpNow - durTimezone - tpMid;
+	auto durMs = std::chrono::duration_cast<std::chrono::milliseconds>(durSince);
+	return durMs.count();
+}
+
+void HandleDailyQuests(Packet &pkt)
+{
+	uint8 subcode = 0;
+	pkt >> subcode;
+	switch (subcode)
+	{
+		case (uint8)DailyQuestOp::sendlist:
+		{
+			uint8 isize = 0;
+			pkt >> isize;
+			for (uint8 i = 0; i < isize; i++)
+			{
+				DailyQuest* quest = new DailyQuest;
+				pkt >> quest->index >> quest->questtype;
+				for (uint8 j = 0; j < 4; j++)
+				{
+					pkt >> quest->Mob[j] >> quest->Reward[j] >> quest->Count[j];
+				}
+				pkt >> quest->KillTarget >> quest->ZoneID >> quest->replaytime;
+
+				if (Engine->uiQuestPage)
+				{
+					Engine->uiQuestPage->kcbq_quests.push_back(quest);
+				}
+
+			}
+		}
+		break;
+		case (uint8)DailyQuestOp::userinfo:
+		{
+			uint8 isize = 0;
+			pkt >> isize;
+			for (uint8 i = 0; i < isize; i++)
+			{
+				uint8 id = 0;
+				pkt >> id;
+
+				uint8 status; uint16 mycount; uint32 time;
+				pkt >> status >> mycount >> time;
+
+				if (Engine->uiQuestPage)
+				{
+					for (uint32 i = 0; i < Engine->uiQuestPage->kcbq_quests.size(); i++)
+					{
+						if (Engine->uiQuestPage->kcbq_quests[i]->index == id)
+						{
+							Engine->uiQuestPage->kcbq_quests[i]->Status = status;
+							Engine->uiQuestPage->kcbq_quests[i]->MyCount = mycount;
+							Engine->uiQuestPage->kcbq_quests[i]->remtime = time;
+						}
+					}
+				}
+
+			}
+			if (Engine->uiQuestPage)
+			{
+				Engine->uiQuestPage->InitQuests();
+			}
+		}
+		break;
+		case (uint8)DailyQuestOp::killupdate:
+		{
+			uint16 mobid;
+			pkt >> mobid;
+			if (Engine->uiQuestPage) Engine->uiQuestPage->KillTrigger(mobid);
+		}
+		break;
+	}
+}
+
+void __cdecl XSafeHandlePacket(Packet pkt)
+{
+	uint8_t SubOpCode;
+	pkt >> SubOpCode;
+
+
+	switch (SubOpCode)
+	{
+	case XSafeOpCodes::ZindanWar:	// Zindanwar score board
+		HandleZindanWar(pkt);
+		break;
+	case XSafeOpCodes::TOPLEFT:
+		if (Engine->m_UiMgr->uiTopLeft != NULL)
+			Engine->m_UiMgr->uiTopLeft->UpdateTopLeftVisible(pkt);
+		break;
+	case XSafeOpCodes::LOTTERY:
+	{
+		uint8 subcode;
+		pkt >> subcode;
+		if (Engine->m_UiMgr->uiLottery == NULL)
+		{
+			Engine->m_UiMgr->uiLottery->OpenLottery();
+
+		}
+
+		if (Engine->m_UiMgr->uiLottery != NULL)
+		{
+			if (subcode == 1) // baþlatma
+			{
+				if (!Engine->m_UiMgr->uiLottery->IsVisible())
+				{
+					Engine->m_UiMgr->uiLottery->SetVisible(true);
+				}
+
+				Engine->m_UiMgr->uiLottery->btn_join->SetState(UI_STATE_BUTTON_NORMAL);
+
+				uint32 reqItems[5] = { 0 }, reqItemsCount[5] = { 0 }, rewardItems[4] = { 0 };
+				uint32 remainingTime = 0;
+				uint32 partLimit = 0;
+				uint32 participant = 0;
+				uint32 ticketID = 0;
+
+				for (int i = 0; i < 5; i++)
+					pkt >> reqItems[i] >> reqItemsCount[i];
+				for (int i = 0; i < 4; i++)
+					pkt >> rewardItems[i];
+
+				pkt >> partLimit >> remainingTime >> participant >> ticketID;
+
+				Engine->lotteryEvent.limit = partLimit;
+				Engine->lotteryEvent.participant = participant;
+				Engine->lotteryEvent.remainingTime = remainingTime;
+
+				float per = 0.0F;
+				if (Engine->lotteryEvent.participant > 0)
+					per = (1 / Engine->lotteryEvent.participant) * 100;
+				else
+					per = 100.0F;
+				Engine->m_UiMgr->uiLottery->str_change->SetString(string_format(xorstr("%.3f%%"), per));
+				Engine->m_UiMgr->uiLottery->str_participant->SetString(string_format(xorstr(" %d / %d"), participant, partLimit));
+				if (ticketID == 0)
+					Engine->m_UiMgr->uiLottery->str_ticket->SetString(xorstr("-"));
+				else {
+					Engine->m_UiMgr->uiLottery->str_ticket->SetString(string_format(xorstr("#%d"), ticketID));
+					Engine->m_UiMgr->uiLottery->btn_join->SetState(UI_STATE_BUTTON_DISABLE);
+				}
+
+				/*for (int i = 0; i < 5; i++) */Engine->m_UiMgr->uiLottery->ticket_buy_count->SetString(string_format(xorstr("%d"), reqItemsCount[0]));
+				Engine->m_UiMgr->uiLottery->Update(reqItems, reqItemsCount, rewardItems);
+			}
+			else if (subcode == 2) // katýlýmcý güncellemesi
+			{
+				Engine->lotteryEvent.participant++;
+				float per = 0.0F;
+				per = (1 / Engine->lotteryEvent.participant) * 100;
+				Engine->m_UiMgr->uiLottery->str_change->SetString(string_format(xorstr("%.3f%%"), per));
+				Engine->m_UiMgr->uiLottery->str_participant->SetString(string_format(xorstr(" %d / %d"), Engine->lotteryEvent.participant, Engine->lotteryEvent.limit));
+			}
+			else if (subcode == 3) // join
+			{
+				uint8 ok = 0;
+				uint32 ticket = 0;
+				pkt >> ok;
+				if (ok == 1)
+				{
+					pkt >> ticket;
+					printf("Lottery Event Participant Count %d \n", ticket);
+					//Engine->m_UiMgr->uiLottery->btn_join->SetState(UI_STATE_BUTTON_DISABLE);
+					Engine->m_UiMgr->uiLottery->str_ticket->SetString(string_format(xorstr("#%d"), ticket));
+					Engine->m_UiMgr->ShowMessageBox(xorstr("Lottey Event"), "Etkinlige Basariyla Katildiniz.", MsgBoxTypes::Ok);
+				}
+				else {
+					std::string msg = "";
+					pkt >> msg;
+					Engine->m_UiMgr->ShowMessageBox(xorstr("Error"), msg, MsgBoxTypes::Ok);
+				}
+			}
+			else if (subcode == 4) // end
+			{
+				uint32 reqItems[5] = { 0 }, reqItemsCount[5] = { 0 }, rewardItems[4] = { 0 };
+				Engine->lotteryEvent.limit = 0;
+				Engine->lotteryEvent.participant = 0;
+				Engine->lotteryEvent.remainingTime = 0;
+
+				/*for (int i = 0; i < 5;i++) */Engine->m_UiMgr->uiLottery->ticket_buy_count->SetString(xorstr("-"));
+				Engine->m_UiMgr->uiLottery->str_change->SetString(xorstr("0%"));
+				Engine->m_UiMgr->uiLottery->str_participant->SetString(string_format(xorstr(" %d / %d"), 0, 0));
+				Engine->m_UiMgr->uiLottery->str_ticket->SetString(xorstr("-"));
+				Engine->m_UiMgr->uiLottery->btn_join->SetState(UI_STATE_BUTTON_NORMAL);
+				Engine->m_UiMgr->uiLottery->Update(reqItems, reqItemsCount, rewardItems, true);
+
+				if (Engine->m_UiMgr->uiLottery->IsVisible())
+				{
+					Engine->m_UiMgr->uiLottery->SetVisible(false);
+				}
+
+				if (Engine->uiTopRightNewPlug != NULL)
+				{
+					if (!Engine->m_UiMgr->uiTopLeft->IsVisible() && Engine->m_UiMgr->uiTopLeft->btn_lotteryevent)
+					{
+						Engine->m_UiMgr->uiTopLeft->btn_lotteryevent->SetVisible(false);
+						Engine->m_UiMgr->uiTopLeft->btn_lotteryevent->SetState(UI_STATE_BUTTON_DISABLE);
+					}
+				}
+			}
+		}
+	}
+	break;
+	case XSafeOpCodes::ERRORMSG: //30.08.2020
+	{
+		uint8 subcode;
+		pkt >> subcode;
+
+		if (subcode == 1) // join
+		{
+			uint8 ok = 0;
+			uint32 ticket = 0;
+			pkt >> ok;
+			if (ok == 1)
+			{
+				std::string msgtitle = "", msg = "";
+				pkt >> msgtitle >> msg;
+				Engine->m_UiMgr->ShowMessageBox(msgtitle, msg, MsgBoxTypes::Ok);
+			}
+		}
+	}
+	break;
+	case XSafeOpCodes::MESSAGE:
+	{
+		string title, message;
+		pkt >> title >> message;
+
+		if (Engine->m_UiMgr != NULL && !title.empty() && !message.empty() && title.length() <= 30 && message.length() <= 255)
+			Engine->m_UiMgr->ShowMessageBox(title, message, MsgBoxTypes::Ok);
+	}
+	break;
+	case XSafeOpCodes::MERCHANTLIST:
+		Engine->m_UiMgr->ShowMerchantList(pkt);
+		break;
+	case XSafeOpCodes::AUTODROP:
+	{
+		uint8 type;
+		uint32 nItemID;
+		pkt >> type >> nItemID;
+
+		if (!Engine->m_bGameStart || Engine->m_UiMgr == NULL)
+			return;
+
+		if (type == 0) // auto mining
+		{
+			if (Engine->m_UiMgr->uiDropResult == NULL) {
+				Engine->m_UiMgr->ShowDropResult();
+				Engine->m_UiMgr->uiDropResult->SetVisible(false);
+			}
+
+			Engine->m_UiMgr->uiDropResult->SetTitle("Auto Mining");
+			Engine->m_UiMgr->uiDropResult->AddItem(nItemID);
+			
+			TABLE_ITEM_BASIC * item = Engine->tblMgr->getItemData(nItemID);
+			if (item != nullptr)
+				Engine->WriteInfoMessage((char*)string_format(xorstr("[Mining] you received %s"), item->strName.c_str()).c_str(), 0xFFF2AB);
+
+			Engine->uiTopRightNewPlug->DropResultStatus(true);
+		}
+		else if (type == 1) // auto fishing
+		{
+			if (Engine->m_UiMgr->uiDropResult == NULL) {
+				Engine->m_UiMgr->ShowDropResult();
+				Engine->m_UiMgr->uiDropResult->SetVisible(false);
+			}
+
+			Engine->m_UiMgr->uiDropResult->SetTitle("Auto Fishing");
+			Engine->m_UiMgr->uiDropResult->AddItem(nItemID);
+			
+			TABLE_ITEM_BASIC * item = Engine->tblMgr->getItemData(nItemID);
+			if (item != nullptr)
+				Engine->WriteInfoMessage((char*)string_format(xorstr("[Fishing] you received %s"), item->strName.c_str()).c_str(), 0xFFF2AB);
+
+			Engine->uiTopRightNewPlug->DropResultStatus(true);
+		}
+		else if (type == 2)
+		{
+			if (Engine->m_UiMgr->uiDropResult != NULL)
+			{
+				Engine->m_UiMgr->uiDropResult->Close();
+				Engine->uiTopRightNewPlug->DropResultStatus(false);
+			}
+		}
+		else
+		{
+			if (Engine->m_UiMgr->uiDropResult != NULL)
+			{
+				Engine->m_UiMgr->uiDropResult->Close();
+				Engine->uiTopRightNewPlug->DropResultStatus(false);
+			}
+			Engine->WriteInfoMessageExt((char*)xorstr("[Mining/Fishing] stopped"), 0xFFF2AB);
+		}
+	}
+	break;
+//#if 0
+//	case XSafeOpCodes::TEMPITEMS:
+//	{
+//		if (tmpItemsINIT)
+//			break;
+//
+//		tmpItemsINIT = true;
+//
+//		std::string name = string_format(xorstr("ui\\TemporaryItemList%d%d.uif"), GetCurrentProcessId(), GetCurrentProcessId());
+//		Engine->FileRC5(xorstr("ui\\TemporaryItemList.Msoft"), name.c_str());
+//		Engine->m_UiMgr->uiTempItemList = new CTempItemList();
+//		Engine->m_UiMgr->uiTempItemList->Init(Engine->m_UiMgr);
+//		Engine->m_UiMgr->uiTempItemList->LoadFromFile(Engine->m_BasePath + name.c_str(), N3FORMAT_VER_1068);
+//		Engine->m_UiMgr->AddChild(Engine->m_UiMgr->uiTempItemList);
+//		remove(name.c_str());
+//
+//		uint8 count;
+//		pkt >> count;
+//
+//		for (int i = 0; i < count; i++)
+//		{
+//			_SimpleItem item;
+//			pkt >> item.slot >> item.nItemID >> item.pos >> item.time;
+//			Engine->m_UiMgr->uiTempItemList->itemList.push_back(item);
+//		}
+//
+//		Engine->m_UiMgr->uiTempItemList->SetItem();
+//	}
+//	break;
+//#endif
+	case XSafeOpCodes::KCUPDATE:
+	{
+		uint32 cash;
+		pkt >> cash;
+
+		Engine->Player.KnightCash = cash;
+
+		if (Engine->uiState != NULL)
+		{
+			Engine->uiState->m_iCash = cash;
+			Engine->uiState->UpdateUI();
+		}
+
+		if (Engine->uiTradeInventory != NULL)
+			Engine->uiTradeInventory->UpdateTotal(cash);
+
+		if (Engine->m_UiMgr->uiPowerUpStore != NULL)
+			Engine->m_UiMgr->uiPowerUpStore->UpdateCash(cash);
+	}
+	case XSafeOpCodes::USERDATA:
+	{
+		if (Engine->m_PlayerBase != NULL)
+			Engine->m_PlayerBase->Update(pkt);
+	}
+	break;
+	case XSafeOpCodes::CR:
+	{
+		HandleCollectionRace(pkt);
+	}
+	break;
+	case XSafeOpCodes::DROP_REQUEST:
+		Engine->m_UiMgr->ShowDropList(pkt);
+		break;
+	case XSafeOpCodes::DROP_LIST:
+		Engine->m_UiMgr->ShowDropList(pkt);
+		break;
+	case XSafeOpCodes::CASHCHANGE:
+	{
+		uint32 cash;
+		pkt >> cash;
+
+		if (Engine->uiState != NULL)
+		{
+			if (cash > Engine->uiState->m_iCash)
+				Engine->WriteInfoMessageExt((char*)string_format(xorstr("Received %d knight cash."), cash - Engine->uiState->m_iCash).c_str(), 0xFFF2AB);
+			else
+				Engine->WriteInfoMessageExt((char*)string_format(xorstr("Lost %d knight cash."), Engine->uiState->m_iCash - cash).c_str(), 0xFF0000);
+		}
+
+		Engine->Player.KnightCash = cash;
+
+		if (Engine->uiState != NULL)
+		{
+			Engine->uiState->m_iCash = cash;
+			Engine->uiState->UpdateUI();
+		}
+
+		if (Engine->uiTradeInventory != NULL)
+			Engine->uiTradeInventory->UpdateTotal(cash);
+
+		if (Engine->m_UiMgr->uiPowerUpStore != NULL)
+			Engine->m_UiMgr->uiPowerUpStore->UpdateCash(cash);
+	}
+	break;
+	case XSafeOpCodes::INFOMESSAGE:
+	{
+		string message;
+		pkt >> message;
+		Engine->WriteInfoMessageExt((char*)message.c_str(), 0xFFF2AB);
+	}
+	break;
+	case XSafeOpCodes::PUS:
+	{
+		vector<PUSItem> PusItems;
+		
+		uint32_t PusItemCount = pkt.read<uint32_t>();
+		for (uint32 i = 0; i < PusItemCount; i++)
+		{
+			uint32 sID, sItemID, sPrice, sQuantitiy;
+			uint8 sCategory;
+
+			pkt >> sID >> sItemID >> sPrice >> sCategory >> sQuantitiy;
+			PusItems.push_back(PUSItem(sID, sItemID, sPrice, (PUS_CATEGORY)sCategory, sQuantitiy));
+		}
+
+		pusINIT = true;
+		Engine->m_UiMgr->item_list = PusItems;
+	}
+	break;
+	/*case XSafeOpCodes::PROCINFO:
+	{
+		uint16 toWHO = 0;
+		pkt >> toWHO;
+		LM_SendProcess(toWHO);
+	}
+	break;
+	case XSafeOpCodes::ALIVE:
+		LM_StayAlive();
+		break;*/
+	case XSafeOpCodes::OPEN:
+	{
+		string address;
+		pkt >> address;
+		ShellExecuteA(NULL, xorstr("open"), address.c_str(), NULL, NULL, SW_SHOWNORMAL);
+	}
+	break;
+	case XSafeOpCodes::UIINFO:
+	{
+		if (!Engine->m_bHookStart) {
+			StartHook();
+		}
+
+		uint32 cash, moneyreq;
+		int64 exp,maxexp; 
+		uint16 dd, axe, sword, mace, spear, bow, jamadar;
+		pkt >> cash >> dd >> axe >> sword >> mace >> spear >> bow >> jamadar >> moneyreq >> exp >> maxexp;
+
+		Engine->Player.KnightCash = cash;
+		Engine->moneyReq = moneyreq;
+
+		if (Engine->m_PlayerBase == NULL)
+			Engine->m_PlayerBase = new CPlayerBase();
+
+		uint16 m_iSocketID;
+
+		std::string m_strCharacterName;
+		short m_sClass;
+		uint8 m_iRace;
+		uint8 m_iLevel;
+
+		uint8 m_iStr;
+		uint8 m_iHp;
+		uint8 m_iDex;
+		uint8 m_iInt;
+		uint8 m_iMp;
+
+		pkt >> m_iSocketID;
+		pkt.DByte();
+		pkt >> m_strCharacterName >> m_sClass >> m_iRace >> m_iLevel
+			>> m_iStr >> m_iHp >> m_iDex >> m_iInt >> m_iMp;
+
+		tagName tag;
+		pkt >> tag.tag >> tag.r >> tag.g >> tag.b; // tagrenk
+
+		Packet UserInformation;
+		UserInformation << m_iSocketID << m_strCharacterName << m_sClass << m_iRace << m_iLevel << m_iStr << m_iHp << m_iInt << m_iMp;
+
+		if (Engine->m_PlayerBase != NULL)
+			Engine->m_PlayerBase->Update(UserInformation);
+
+		if (Engine->uiState != NULL)
+		{
+			Engine->uiState->m_iCash = cash;
+			Engine->uiState->UpdateUI();
+		}
+
+
+
+		//if (Engine->uiTradeInventory != NULL) Engine->uiTradeInventory->UpdateTotal(cash);
+		if (!tag.tag.empty() && tag.tag != "-" )  
+			Engine->addnewtagid(m_iSocketID, tag);
+		
+		uiINIT = true;
+	}
+	break;
+	case XSafeOpCodes::MERC_WIEWER_INFO:
+	{
+		uint8 subCode;
+		std::string Name;
+		uint8 saat, dakika;
+		pkt.SByte();
+		pkt >> subCode >> Name >> saat >> dakika;
+		switch (subCode)
+		{
+		case 1:
+			Engine->WriteInfoMessageExt((char*)string_format(xorstr("%s visited your merchant at %02d:%02d"), Name.c_str(), saat, dakika).c_str(), -1);
+			break;
+		case 2:
+			Engine->WriteInfoMessageExt((char*)string_format(xorstr("%s left your merchant at %02d:%02d"), Name.c_str(), saat, dakika).c_str(), -1);
+			break;
+		}
+	}
+	break;
+	//case XSafeOpCodes::UPGRADE_RATE: 
+	//	{
+	//		uint32 Rate = pkt.read<uint32>();
+	//		Engine->uiAnvil->SetResult("%" + std::to_string(Rate)); 
+	//	}
+	//	break;
+	case XSafeOpCodes::CASTLE_SIEGE_TIMER:
+		HandleCastleSiegeWarTimer(pkt);
+		break;
+	//case XSafeOpCodes::JOBCHANGE:
+	//{
+	//	enum class test { Open = 1, Finish = 2, Close = 3 };
+
+	//	if (Engine->m_UiMgr == NULL)
+	//		return;
+
+	//	uint8 result;
+	//	pkt >> result;
+
+	//	switch ((test)result)
+	//	{
+	//	case test::Open:
+	//		break;
+	//	case test::Finish:
+	//	{
+	//		Engine->m_UiMgr->ShowMessageBox(xorstr("Job Change Success"), xorstr("Job Change is succesfuly"), Ok);
+	//	}
+	//	break;
+	//	case test::Close:
+	//	{
+	//		int8 ErrorCode;
+	//		pkt >> ErrorCode;
+
+	//		switch (ErrorCode)
+	//		{
+	//		case 0:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("Error 0"), Ok);
+	//			break;
+	//		case -1:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("Job change item was not found on your inventory. Please visit Power Up Store."), Ok);
+	//			break;
+	//		case -2:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("Take off the clothes you are wearing. Please try again."), Ok);
+	//			break;
+	//		case -3:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("Error -3"), Ok);
+	//			break;
+	//		case -4:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("You cannot select the same job again. Please choose a different job."), Ok);
+	//			break;
+	//		case -5:
+	//			Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), xorstr("Job change item was not found on your inventory. Please visit Power Up Store."), Ok);
+	//			break;
+	//		case -6:
+	//			uint32 süre;
+	//			pkt >> süre;
+	//			if (süre < 0) süre = 0;
+	//			if (süre > 10) süre = 10;
+	//			//Engine->m_UiMgr->ShowMessageBox(xorstr("Failed"), string_format("%d", süre), Ok);
+	//			Engine->WriteInfoMessageExt((char*)string_format(xorstr("Please try %d seconds later."), süre).c_str(), 0xa30000);
+	//			break;
+	//		}
+	//	}
+	//	break;
+	//	default:
+	//		break;
+	//	}
+	//}
+	//break;
+	case XSafeOpCodes::ACCOUNT_INFO_SAVE:
+		Engine->HandleAccountInfoSave(pkt);
+		break;
+	case XSafeOpCodes::CHAOTIC_EXCHANGE:
+		Engine->HandleChaoticExchange(pkt);
+		break;
+	case XSafeOpCodes::CHAT_LASTSEEN:
+		Engine->HandleLastSeen(pkt);
+		break;
+	case XSafeOpCodes::AntiAfkList:
+		Engine->RecvAntiAfkList(pkt);
+		break;
+	case XSafeOpCodes::TagInfo:
+		Engine->HandleTagName(pkt);
+	break;
+
+	default:
+		break;
+	}
+}
+
+
+void PearlEngine::addnewtagid(uint16 id, tagName tag) {
+	tagLock.lock();
+	auto itr = tagList.find(id);
+	if (itr != tagList.end()) itr->second = tag;
+	else tagList.insert({ id, tag });
+	tagLock.unlock();
+}
+
+void PearlEngine::HandleTagName(Packet &pkt) {
+	uint8 subcode = pkt.read<uint8>();
+	switch ((tagerror)subcode)
+	{
+	case tagerror::Open:
+	{
+		if (!m_UiMgr) return;
+
+		if (!m_UiMgr->uiTagChange) m_UiMgr->uiTagChange->OpenTagChange();
+		if (!m_UiMgr->uiTagChange) return;
+
+		m_UiMgr->uiTagChange->txt_id->SetString("");
+		m_UiMgr->uiTagChange->SetVisible(true);
+	}
+		break;
+	case tagerror::List:
+	{
+		uint16 counter = 0;
+		pkt >> counter;
+		for (uint16 i = 0; i < counter; i++) {
+			tagName tag;
+			uint16 id = 0;
+			pkt >> id >> tag.tag >> tag.r >> tag.g >> tag.b;
+			addnewtagid(id,tag);
+		}
+	}
+	break;
+	case tagerror::success:
+	{
+		tagName tag;
+		uint8 regipnu = 0; uint16 sockid = -1;
+		pkt >> regipnu >> sockid >> tag.tag >> tag.r >> tag.g >> tag.b;
+		if (!regipnu) Engine->WriteInfoMessageExt((char*)string_format(xorstr("tag change success!")).c_str(), 0xa30000);
+		addnewtagid(sockid, tag);
+	}
+	break;
+	case tagerror::error:
+		Engine->WriteInfoMessageExt((char*)string_format(xorstr("tag change error!")).c_str(), 0xa30000);
+		break;
+	case tagerror::already:
+		Engine->WriteInfoMessageExt((char*)string_format(xorstr("tag change already!")).c_str(), 0xa30000);
+		break;
+	case tagerror::noitem:
+		Engine->WriteInfoMessageExt((char*)string_format(xorstr("tag change no item!")).c_str(), 0xa30000);
+		break;
+	}
+}
+
+void PearlEngine::RecvAntiAfkList(Packet &pkt) {
+	antiAFKProto.clear();
+	uint16 size = 0; pkt >> size;
+	if (!size) return;
+	for (int i = 0; i < size; i++) {
+		uint16 NpcID;
+		pkt >> NpcID;
+		if (!NpcID) continue;
+		antiAFKProto.push_back(NpcID);
+	}
+}
+
+void PearlEngine::HandleLastSeen(Packet &pkt)
+{
+	std::string pTUser = "";
+	pkt >> pTUser;
+	if (pTUser.empty() || pTUser == "")
+		return;
+
+	uint8 UserLastSeen[2];
+	pkt >> UserLastSeen[0] >> UserLastSeen[1];
+
+	_PM_MAP * pPmMap = Engine->pmusers.GetData(pTUser);
+	if (pPmMap == nullptr)
+		return;
+
+	pPmMap->LastSeen[0] = UserLastSeen[0];
+	pPmMap->LastSeen[1] = UserLastSeen[1];
+	pPmMap->LastSeenCheck = true;
+
+}
+void PearlEngine::HandleChaoticExchange(Packet &pkt)
+{
+	enum class ChaoticExchangeResult
+	{
+		ChaoticStop = 1,
+		ChaoticSucces = 2
+	};
+
+	uint8 opcode;
+	pkt >> opcode;
+
+	switch ((ChaoticExchangeResult)opcode)
+	{
+	case ChaoticExchangeResult::ChaoticStop:
+		ChaoticExchangeStop();
+		break;
+	case ChaoticExchangeResult::ChaoticSucces:
+		ChaoticExchangeSucces();
+		break;
+	default:
+		break;
+	}
+}
+
+void PearlEngine::ChaoticExchangeStop()
+{
+	Engine->uiPieceChangePlug->m_bAutoExchangeStarted = false;
+	Engine->uiPieceChangePlug->m_Timer = NULL;
+	Engine->uiPieceChangePlug->m_exCount = 0;
+}
+
+void PearlEngine::ChaoticExchangeSucces()
+{
+	POINT pt;
+	Engine->GetUiPos(Engine->uiPieceChangePlug->m_btnStop, pt);
+	pt.y -= 2;
+	Engine->m_UiMgr->SendMouseProc(UI_MOUSE_LBCLICK, pt, pt);
+}
+
+void __cdecl HandlePacket(Packet pkt)
+{
+	uint8 OpCode = pkt.GetOpcode();
+
+	switch (OpCode)
+	{
+		case XSafe:
+		{
+			XSafeHandlePacket(pkt);
+		}
+		break;
+//		case XSafeVoice:
+//		{
+//			uint16 uid;
+//			uint64 len;
+//			pkt >> uid >> len;
+//
+//			if (len == 0)
+//				return;
+//
+//			unsigned char* buff = new unsigned char[len];
+//
+//			memcpy(&buff[0], &pkt.contents()[sizeof(uint16) + sizeof(uint64)], len);
+//
+//			wv.G729_InitDec();
+//
+//			short* dBuff = new short[22050];
+//
+//			wv.G729_DeCompress(buff, dBuff, len, 0);
+//
+//			if (!voiceStarted) {
+//				voiceStarted = true;
+//				VoiceListener.start();
+//			}
+//
+//			if (VoiceListener.input((unsigned char*)dBuff) == 0) {
+//				VoiceListener.stop();
+//				VoiceListener.start();
+//				VoiceListener.input((unsigned char*)dBuff);
+//			}
+//		}
+//		break;
+		case WIZ_ADD_MSG:
+		{
+			uint8 opcode;
+			pkt >> opcode;
+			if (opcode == 1) Engine->m_UiMgr->uiMerchantWind->MerchantMsgProcess(pkt);
+			else if (opcode == 2) Engine->m_UiMgr->uiNoticeWind->MoticeMsgProcess(pkt);
+		}
+		break;
+		case WIZ_CHAT:
+		{
+			uint8 type, nation;
+			pkt >> type >> nation;
+			if (type == 2)
+			{
+				int16 sID;
+				string user, msg;
+				uint8 auth; 
+				pkt >> sID;
+				pkt.SByte();
+				pkt >> user;
+				pkt.DByte();
+				pkt >> msg >> auth;
+
+				if (user.empty() || msg.empty()/* || auth > 0*/) //Renkli Pm için authority kontrolü kapatýldý 27.09.2020
+					return;
+
+				_PM_MAP * pPmMap = Engine->pmusers.GetData(user);
+				if(pPmMap == nullptr)
+				{
+					_PM_MAP * pPmMap2 = new _PM_MAP;
+					pPmMap2->sID = sID;
+					pPmMap2->uName = user;
+					pPmMap2->msgcount = 1;
+					pPmMap2->btype = auth;
+					pPmMap2->MessageCountCheck = true;
+					Engine->pmusers.PutData(user,pPmMap2);
+				}
+				else
+				{
+					pPmMap->msgcount++;
+					pPmMap->MessageCountCheck = true;
+				}
+				
+			}
+		}
+		break;
+		case WIZ_CHAT_TARGET:
+		{
+			uint8 type;
+			pkt >> type;
+			if (type == 1)
+			{
+				uint8 auth;
+				int16 tmp;
+				string user;
+				pkt >> tmp >> user >> auth;
+				if (tmp == 1)
+				{
+					if (user.empty()/* || auth > 0*/) //Renkli Pm için authority kontrolü kapatýldý 27.09.2020
+						return;
+					
+					_PM_MAP * pPmMap = Engine->pmusers.GetData(user);
+					if (pPmMap == nullptr)
+					{
+						_PM_MAP * pPmMap = new _PM_MAP;
+						pPmMap->uName = user;
+						pPmMap->msgcount = 0;
+						pPmMap->btype = auth;
+						pPmMap->MessageCountCheck = true;
+						Engine->pmusers.PutData(user, pPmMap);
+					}
+				}
+			}
+		}
+		break;
+		case WIZ_CLASS_CHANGE:
+		{
+			uint8 SubOpCode = 0, ReturnValue = 0;
+			pkt >> SubOpCode >> ReturnValue;
+
+			if (SubOpCode == 3 && ReturnValue == 1)
+			{
+				uint32 gold;
+				uint16 str, hp, dex, intx, mp;
+				int16 maxhp, maxmp;
+				uint16 totalhit;
+				uint32 maxweight;
+				int16 points;
+					
+				pkt >> gold >> str >> hp >> dex >> intx >> mp >> maxhp >> maxmp >> totalhit >> maxweight >> points;
+				if (Engine->uiHPBarPlug != NULL)
+				{
+					Engine->uiHPBarPlug->HPChange(maxhp, maxhp);
+					Engine->uiHPBarPlug->MPChange(maxmp, maxmp);
+				}
+			}
+		}
+		break;
+		case WIZ_POINT_CHANGE:
+		{
+			uint8 subcode;
+			pkt >> subcode;
+			uint32 tmp32;
+			uint16 maxhp, hp, maxmp, mp, tmp;
+			pkt >> tmp >> maxhp >> maxmp >> tmp >> tmp32 >> hp >> mp;
+			if (Engine->uiHPBarPlug != NULL)
+			{
+				Engine->uiHPBarPlug->HPChange(hp, maxhp);
+				Engine->uiHPBarPlug->MPChange(mp, maxmp);
+			}
+		}
+		break;
+		case WIZ_STATE_CHANGE:
+		{
+			uint8 bType; /*= pkt.read<uint8>(), buff;*/
+			uint16 GetID;
+			uint32 nBuff;/* = pkt.read<uint32>();
+			buff = *(uint8 *)&nBuff; // don't ask*/
+			pkt >> GetID >> bType >> nBuff;		
+
+		}
+		break;
+		case WIZ_LEVEL_CHANGE:
+		{
+			short maxhp, hp, maxmp, mp;
+			uint16 sock;
+			uint8 level, freeskill;
+			int16 points;
+			int64 maxexp, xp;
+			pkt >> sock >> level >> points >> freeskill >> maxexp >> xp >> maxhp >> hp >> maxmp >> mp;
+			if (Engine->uiHPBarPlug != NULL) {
+				Engine->uiHPBarPlug->HPChange(hp, maxhp);
+		#if (HOOK_SOURCE_VERSION == 1299)
+				Engine->uiHPBarPlug->MaxExp = maxexp;
+				Engine->uiHPBarPlug->MPChange(mp, maxmp);
+				Engine->uiHPBarPlug->ExpChange(xp, maxexp);
+		#endif
+				if (Engine->dc) Engine->dc->Update(true);
+			}
+		}
+		break;
+		case WIZ_EXP_CHANGE:
+		{
+			uint8 opcode;
+			int64 exp;
+			pkt >> opcode >> exp;
+		#if (HOOK_SOURCE_VERSION == 1299)
+			if (opcode == 1 && Engine->uiHPBarPlug != NULL) {
+				Engine->uiHPBarPlug->ExpChange(exp, Engine->uiHPBarPlug->MaxExp);
+			}
+			/*if (Engine->uiHPBarPlug != NULL) {
+				
+			}*/
+		#endif
+		}
+		break;
+		case WIZ_HP_CHANGE:
+		{
+			short maxhp, hp;
+			pkt >> maxhp >> hp;
+			if (Engine->uiHPBarPlug != NULL)
+				Engine->uiHPBarPlug->HPChange(hp, maxhp);
+		}
+		break;
+		case WIZ_MSP_CHANGE:
+		{
+			short maxmp, mp;
+			pkt >> maxmp >> mp;
+			if (Engine->uiHPBarPlug != NULL)
+				Engine->uiHPBarPlug->MPChange(mp, maxmp);
+		}
+		break;
+		case WIZ_SEL_CHAR:
+			Engine->m_bSelectedCharacter = true;
+			break;
+		case WIZ_MYINFO:
+		{
+			Engine->m_bSelectedCharacter = true;
+			Engine->m_bGameStart = true;
+			SendHWID();
+		}
+		break;
+		case WIZ_PREMIUM:
+		{
+			uint8 subcode;
+			pkt >> subcode;
+			//printf("WIZ_PREMIUM subcode : %d\n", subcode);
+			if (subcode == 2)
+			{
+				uint8 PremiumStatus;
+				uint32 sPremiumDay;
+				pkt >> PremiumStatus >> sPremiumDay;
+
+				if (Engine->uiClanWindowPlug != NULL)
+				{
+					Engine->SetStringColor(Engine->uiClanWindowPlug->ClanPremStatus, D3DCOLOR_ARGB(255, 0, 254, 0));
+					Engine->SetString(Engine->uiClanWindowPlug->ClanPremStatus, "Active");
+				}
+			}
+			else
+			{
+				if (Engine->uiClanWindowPlug != NULL)
+				{
+					Engine->SetStringColor(Engine->uiClanWindowPlug->ClanPremStatus, D3DCOLOR_ARGB(255, 255, 0, 0));
+					Engine->SetString(Engine->uiClanWindowPlug->ClanPremStatus, "DeActive");
+				}
+			}
+		}
+		break;
+//		case WIZ_PARTY:
+//		{
+//			uint8 subcode;
+//			pkt >> subcode;
+//			if (subcode == PARTY_INSERT)
+//			{
+//				short partyid, maxhp, hp, maxmp, mp;
+//				uint8 ret, level, nation, UserPartyType;
+//				uint16 iclass;
+//				string userName;
+//				//pkt >> ret >> userName >> maxhp >> hp >> level >> iclass >> maxmp >> mp >> nation;
+//				pkt >> partyid >> ret >> userName >> maxhp >> hp >> level >> iclass >> maxmp >> mp >> nation >> UserPartyType;
+//				Engine->m_bInParty = true;
+//#if (HOOK_SOURCE_VERSION == 2400)	
+//				if (Engine->uiTaskbarMain != NULL) {
+//					Engine->SetState(Engine->uiTaskbarMain->m_btnPartySettings, UI_STATE_BUTTON_NORMAL);
+//				}
+//#endif
+//			#if (HOOK_SOURCE_VERSION == 1299)	
+//				if (Engine->m_bInParty == true)
+//				{
+//					if (Engine->uiTaskbarMain != NULL)
+//					{
+//						Engine->SetVisible(Engine->uiTaskbarMain->m_btninvite, false);
+//						Engine->SetState(Engine->uiTaskbarMain->m_btninvite, UI_STATE_BUTTON_DOWN);
+//						Engine->SetVisible(Engine->uiTaskbarMain->m_btndisband, true);
+//						Engine->SetState(Engine->uiTaskbarMain->m_btndisband, UI_STATE_BUTTON_NORMAL);
+//					}
+//				}
+//			#endif
+//			}
+//			else if (subcode == PARTY_DELETE)
+//			{
+//				Engine->m_bInParty = false;
+//				if (Engine->uiTaskbarMain != NULL) {
+//					Engine->SetState(Engine->uiTaskbarMain->m_btnPartySettings, UI_STATE_BUTTON_DISABLE);
+//				}
+//			}
+//		}
+//		break;
+		case WIZ_ZONE_CHANGE:
+			Engine->HandleZoneChange(pkt);
+		break;
+		case WIZ_TARGET_HP:
+		{
+			if (!Engine->m_bHookStart) {
+				StartHook();
+			}
+			if (Engine->uiTargetBar != NULL)
+				Engine->uiTargetBar->SetTargetHp(pkt);
+		}
+		break;
+		case WIZ_GAMESTART:
+			Engine->HandleGameStart(pkt);
+		break;
+//		case WIZ_ITEM_MOVE:
+//		{
+//			if (!Engine->m_bHookStart) {
+//				StartHook();
+//			}
+//
+//			uint8 command, subcommand, x1;
+//			uint16 m_sTotalHit, m_sTotalAc;
+//			uint32 m_sMaxWeight;
+//			short m_MaxHp, m_MaxMp;
+//			int16 BonusTotal[5];
+//
+//			uint16 m_sFireR, m_sColdR, m_sLightningR;
+//			uint16 m_sMagicR, m_sDiseaseR, m_sPoisonR;
+//
+//			int16 hp, mp;
+//			uint32 cash, moneyreq;
+//			uint16 dd, axe, sword, mace, spear, bow, jamadar;
+//
+//			pkt >> command >> subcommand;
+//
+//			if (subcommand != 0)
+//			{
+//				pkt >> m_sTotalHit >> m_sTotalAc >> m_sMaxWeight >> x1 >> m_MaxHp >> m_MaxMp;
+//				for (int z = 0; z < 5; z++)
+//					pkt >> BonusTotal[z];
+//
+//				pkt >> m_sFireR >> m_sColdR >> m_sLightningR >> m_sMagicR >> m_sDiseaseR >> m_sPoisonR;
+//				pkt >> cash >> dd >> axe >> sword >> mace >> spear >> bow >> jamadar >> moneyreq >> hp >> mp;
+//
+//				Engine->Player.KnightCash = cash;
+//
+//				if (Engine->uiState != NULL)
+//				{
+//					Engine->uiState->m_iCash = cash;
+//					Engine->uiState->m_iDagger = dd;
+//					Engine->uiState->m_iAxe = axe;
+//					Engine->uiState->m_iSword = sword;
+//					Engine->uiState->m_iClub = mace;
+//					Engine->uiState->m_iSpear = spear;
+//					Engine->uiState->m_iArrow = bow;
+//#if (HOOK_SOURCE_VERSION == 2400)
+//					Engine->uiState->m_iJamadar = jamadar;
+//#endif
+//					Engine->uiState->UpdateUI();
+//				}
+//
+//				if (Engine->uiTradeInventory != NULL)
+//					Engine->uiTradeInventory->UpdateTotal(cash);
+//
+//				if (Engine->uiHPBarPlug != NULL)
+//				{
+//					Engine->uiHPBarPlug->HPChange(hp, m_MaxHp);
+//					Engine->uiHPBarPlug->MPChange(mp, m_MaxMp);
+//				}
+//				uiINIT = true;
+//			}
+//		}
+//		break;
+		case WIZ_MERCHANT:
+		{
+			uint8 subCode;
+			pkt >> subCode;
+
+			printf("%d\n", subCode);
+
+			if (Engine->m_MerchantMgr != NULL)
+			{
+				printf("%d 2\n", subCode);
+				if (subCode == MERCHANT_ITEM_ADD)
+					Engine->m_MerchantMgr->UpdateRecentItemAddReq(pkt);
+				else if (subCode == MERCHANT_SLOT_UPDATE)
+					Engine->m_MerchantMgr->UpdateItemDisplaySlots(pkt);
+				else if (subCode == MERCHANT_ITEM_CANCEL)
+					Engine->m_MerchantMgr->RemoveItemFromSlot(pkt);
+				else if (subCode == MERCHANT_INSERT)
+					Engine->m_MerchantMgr->MerchantCreated(pkt);
+				else if (subCode == MERCHANT_ITEM_LIST)
+					Engine->m_MerchantMgr->SetTheirMerchantSlots(pkt);
+				else if (subCode == MERCHANT_TRADE_CANCEL)
+					Engine->m_MerchantMgr->ResetMerchant();
+			}
+		}
+		break;
+		case WIZ_ITEM_UPGRADE:
+			{
+				uint8 subCode;
+				pkt >> subCode;
+				if (subCode == ITEM_BIFROST_EXCHANGE)
+				{
+					uint8 resultOpCode;
+					pkt >> resultOpCode;
+
+					if (resultOpCode == Failed) // kýrdýrmayý durdur
+					{
+						Engine->uiPieceChangePlug->m_bAutoExchangeStarted = false;
+						Engine->uiPieceChangePlug->m_Timer = NULL;
+					}
+					else if (resultOpCode == Success)
+					{
+						POINT pt;
+						Engine->GetUiPos(Engine->uiPieceChangePlug->m_btnStop, pt);
+						pt.y -= 2;
+						Engine->m_UiMgr->SendMouseProc(UI_MOUSE_LBCLICK, pt, pt);
+					}
+				}
+			}
+			break;
+//		case WIZ_RANK:
+//			Engine->Player.RankPacketReceived = true;
+//			break;
+//		case WIZ_PARTY_HP:
+//		{
+//			uint8 subCode;
+//			pkt >> subCode;
+//
+//			if (subCode == 1 && Engine->uiPartyBBS != NULL)
+//				Engine->uiPartyBBS->UpdatePartyUserHPBAR(pkt);
+//		}
+//			break;
+	}
+
+	if (!Engine->UPanelStart && Engine->m_bGameStart)
+	{
+		Packet result(XSafe);
+		result << uint8_t(XSafeOpCodes::UIINFO);
+		Engine->Send(&result);
+		Engine->UPanelStart = true;
+	}
+	
+	/*Engine->m_PlayerBase->UpdateGold();*/
+}
+
+void PearlEngine::HandleAccountInfoSave(Packet &pkt)
+{
+	enum class AccountInfoSave {Open = 1,Close = 2};
+
+	uint8 Opcode;
+	pkt >> Opcode;
+	switch ((AccountInfoSave)Opcode)
+	{
+	case AccountInfoSave::Open:
+	{
+		if (m_UiMgr == NULL)
+			return;
+
+		if (m_UiMgr->uiAccountRegister == NULL)
+		{
+			m_UiMgr->uiAccountRegister->OpenAccountRegister();
+		}
+		Engine->m_UiMgr->uiAccountRegister->Open();
+	}
+	break;
+	case AccountInfoSave::Close:
+	{
+		uint8 Opcode;
+		pkt >> Opcode;
+
+		if (m_UiMgr == NULL 
+			|| m_UiMgr->uiAccountRegister == NULL)
+			return;
+
+		if (Opcode != 1) {
+			Engine->m_UiMgr->uiAccountRegister->RefreshText();
+			Engine->WriteInfoMessageExt((char*)string_format(xorstr("Account Info Save Failed")).c_str(), 0xa30000);
+			return;
+		}
+
+		if (Engine->m_UiMgr->uiAccountRegister != NULL) {
+			Engine->m_UiMgr->uiAccountRegister->Close();
+		}
+	}
+	break;
+	default:
+		break;
+	}
+}
+
+void PearlEngine::HandleGameStart(Packet &pkt)
+{
+	m_bSelectedCharacter = true;
+	m_bGameStart = true;
+	LoadingControl = false;
+	gameStarted = true;
+	if (Engine->dc) Engine->dc->Update(true);
+}
+
+void PearlEngine::HandleZoneChange(Packet &pkt)
+{
+	uint8 subCode;
+	pkt >> subCode;
+
+	if (Engine->dc) Engine->dc->Update(true);
+
+	switch (subCode)
+	{
+	case 2:
+		LoadingControl = false;
+		Player.isTeleporting = false;
+		break;
+	case 3:
+	{
+		uint16 newZone;
+		pkt >> newZone;
+		Player.ZoneID = newZone;
+		Player.isTeleporting = false;
+		LoadingControl = false;
+	}
+	break;
+	}
+}
+
+std::mutex recv_mutex;
+
+void RecvMake(RECV_DATA * pRecv)
+{
+	const std::lock_guard<std::mutex> lock(recv_mutex);
+
+	Packet pkt;
+
+	unsigned int length = pRecv->Size;
+	if (length > 0)
+		length--;
+
+	pkt = Packet(pRecv->Data[0]);
+	if (length > 0)
+	{
+		pkt.resize(length);
+		memcpy((void*)pkt.contents(), &pRecv->Data[1], length);
+	}
+
+	HandlePacket(pkt);
+}
+
+DWORD rdwordExt(DWORD ulBase)
+{
+	if (!IsBadReadPtr((VOID*)ulBase, sizeof(DWORD)))
+	{
+		return(*(DWORD*)(ulBase));
+	}
+	return 0;
+}
+
+typedef bool(__stdcall* tRecv)(RECV_DATA* pRecv, void* pParam);
+tRecv oRecv;
+DWORD pktRet = 0;
+
+bool WINAPI hkRECV(RECV_DATA* pRecv, void* pParam)
+{
+	if (pRecv->Size < 1)
+		return true;
+
+	pktRet = rdwordExt(KO_DLG);
+
+	if (pktRet == 0)
+		return true;
+
+	__asm
+	{
+		MOV ECX, pktRet
+		PUSH pParam
+		PUSH pRecv
+		CALL oRecv
+	}
+
+	RecvMake(pRecv);
+
+	//async(RecvMake, pRecv).get();
+}
+
+const DWORD KO_OPEN_PUS = 0x008B623A;
+
+void __fastcall pusuAc()
+{
+	if (Engine->m_UiMgr->uiPowerUpStore == NULL)
+	{
+		Engine->m_UiMgr->uiPowerUpStore->OpenPowerUpStore();
+	}
+	Engine->m_UiMgr->uiPowerUpStore->UpdateItemList(Engine->m_UiMgr->item_list);
+	Engine->m_UiMgr->uiPowerUpStore->Open();
+}
+
+void __declspec(naked) hkOpenPUS()
+{
+	__asm {
+		pushad
+		pushfd
+		call pusuAc
+		popfd
+		popad
+		mov edx, KO_OPEN_PUS
+		add edx, 9
+		push edx
+		ret
+	}
+}
+
+void PearlEngine::InitRecvHook()
+{
+	DetourFunction((PBYTE)KO_OPEN_PUS, (PBYTE)hkOpenPUS);
+	oRecv = (tRecv)DetourFunction((PBYTE)KO_RECV_FUNC, (PBYTE)hkRECV);
+}
+
+/* Connection Gain or Lose */
+
+int WINAPI ConnectDetour(SOCKET s, const sockaddr* name, int namelen) 
+{
+	struct sockaddr_in* addr_in = (struct sockaddr_in*)name;
+	char * _s = inet_ntoa(addr_in->sin_addr);
+	string hostAddress = string(_s);
+
+	Engine->m_connectedIP = hostAddress;
+
+	if (!IsLicensed(hostAddress))
+	{
+		if (Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->ShowMessageBox(xorstr("Baðlantý Reddedildi"), xorstr("Sunucu ve Client arasýnda Ip adresi uyumsuz."), Ok, PARENT_LOGIN);
+		else
+			Engine->Shutdown(xorstr("Baðlantý Reddedildi Sunucu ve Client arasýnda Ip adresi uyumsuz."));
+		return WSAECONNREFUSED;
+	}
+
+	/*if (hostAddress != SERVER_IP 
+		&& hostAddress != SERVER_IP2 
+		&& hostAddress != SERVER_IP3 
+		&& hostAddress != SERVER_IP4 
+		&& hostAddress != SERVER_IP5 
+		&& hostAddress != SERVER_IP6)
+	{
+		if (Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->ShowMessageBox(xorstr("Baðlantý Reddedildi"), xorstr("Sunucu ve Client arasýnda Ip adresi uyumsuz."), Ok, PARENT_LOGIN);
+
+		return WSAECONNREFUSED;
+	}
+*/
+	return OrigConnect(s, name, namelen);
+}
+
+int WSAAPI WSAStartupDetour(WORD wVersionRequired, LPWSADATA lpWSAData) 
+{
+	isAlive = true;
+	return OrigWSAStartup(wVersionRequired, lpWSAData);
+}
+
+int WSAAPI WSAConnectDetour(SOCKET s, const sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
+	struct sockaddr_in* addr_in = (struct sockaddr_in*)name;
+	char* _s = inet_ntoa(addr_in->sin_addr);
+	string hostAddress = string(_s);
+
+	Engine->m_connectedIP = hostAddress;
+
+	if (!IsLicensed(hostAddress))
+	{
+		if (Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->ShowMessageBox(xorstr("Baðlantý Reddedildi"), xorstr("Sunucu ve Client arasýnda Ip adresi uyumsuz."), Ok, PARENT_LOGIN);
+		else
+			Engine->Shutdown(xorstr("Baðlantý Reddedildi Sunucu ve Client arasýnda Ip adresi uyumsuz."));
+		return WSAECONNREFUSED;
+	}
+
+	/*if (hostAddress != SERVER_IP
+		&& hostAddress != SERVER_IP2
+		&& hostAddress != SERVER_IP3
+		&& hostAddress != SERVER_IP4
+		&& hostAddress != SERVER_IP5
+		&& hostAddress != SERVER_IP6)
+	{
+		if (Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->ShowMessageBox(xorstr("Baðlantý Reddedildi"), xorstr("Sunucu ve Client arasýnda Ip adresi uyumsuz."), Ok, PARENT_LOGIN);
+
+		return WSAECONNREFUSED;
+	}*/
+
+	return OrigWSAConnect(s, name, namelen, lpCalleeData, lpCalleeData, lpSQOS, lpGQOS);
+}
+
+/* ----------------------- */
+
+void PearlEngine::InitJmpHook(DWORD hookFuncAddr, DWORD myFuncAddr)
+{
+	SetMemArray(hookFuncAddr, 0x90, 6);
+	JMPHOOK(hookFuncAddr, myFuncAddr);
+}
+
+inline void PearlEngine::JMPHOOK(DWORD Addr1, DWORD Addr2)
+{
+	BYTE jmp[] = { 0xE9,0,0,0,0 };
+	DWORD diff = CalculateCallAddrWrite(Addr2, Addr1);
+
+	memcpy(jmp + 1, &diff, 4);
+	WriteProcessMemory(HANDLE(-1), (LPVOID)Addr1, jmp, 5, 0);
+}
+
+void SendHWID()
+{
+	isAlive = true;
+	char AccName[25];
+	ReadProcessMemory(GetCurrentProcess(), (LPVOID)KO_ACC, AccName, sizeof(AccName), NULL);
+	string m_strAccountID = string(AccName);
+	uint16 MACData1, MACData2 = 0;
+	GetMacHash(MACData1, MACData2);
+	int64 UserHardwareID = GetHardwareID();
+	// yeni eklendi
+	SHA1 sha;
+	string itemorg = md5(sha.from_file(Engine->m_BasePath + xorstr("Data\\item_org_us.tbl")));
+	string skillmagic = md5(sha.from_file(Engine->m_BasePath + xorstr("Data\\Skill_Magic_Main_us.tbl")));
+	string zones = md5(sha.from_file(Engine->m_BasePath + xorstr("Data\\Zones.tbl")));
+	string skillmagictk = md5(sha.from_file(Engine->m_BasePath + xorstr("Data\\Skill_Magic_Main_tk.tbl")));
+	//string srcversion = "08a406419fb655942c4e319530734b14"; //16.09.2020 dllversion uyumsuz ise dc eder
+	string srcversion = "ef97679f28771ba35b9e1a39be5cd733"; //06.12.2020 dllversion uyumsuz ise dc eder
+
+	Packet result(XSafe);
+	result << uint8(22) << m_strAccountID << itemorg << skillmagic << zones << skillmagictk << srcversion; //16.09.2020 dllversion uyumsuz ise dc eder
+	// ------
+	Engine->Send(&result);
+}
+
+DWORD GetModuleSize(DWORD processID, char * module)
+{
+	HANDLE hSnap;
+	MODULEENTRY32 xModule;
+	hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, processID);
+	xModule.dwSize = sizeof(MODULEENTRY32);
+	if (Module32First(hSnap, &xModule)) 
+	{
+		while (Module32Next(hSnap, &xModule)) 
+		{
+			if (!strncmp((char*)xModule.szModule, module, 8)) 
+			{
+				CloseHandle(hSnap);
+				return (DWORD)xModule.modBaseSize;
+			}
+		}
+	}
+	CloseHandle(hSnap);
+	return 0;
+}
+
+// Packet simulation
+
+inline void SetByte(char * tBuf, BYTE sByte, int & index)
+{
+	*(tBuf + index) = (char)sByte;
+	index++;
+};
+
+inline void SetString(char * tBuf, char * sBuf, int len, int& index)
+{
+	memcpy(tBuf + index, sBuf, len);
+	index += len;
+};
+
+char * sPacket;
+uint8_t PacketMain = 0;
+int32_t pSiz = 0, Send_Index = 0, ReturnAdress = 0;
+DWORD HookAddres = 0, PushAdress = 0, BackToAdress = 0;
+uint8 header = 0, subCode = 0;
+uint32 nPrice, nItemID;
+uint16 sCount;
+uint8 bSrcPos, bDstPos, bMode;
+uint32 nSkillID = 0;
+int16 myID = 0, targetID = 0, targetX = 0, targetY = 0, targetZ = 0;
+
+uint16 nObjectID = 0;
+uint32 nExchangeItemID = 0, CheckReturnValue = 0;
+int8_t nExchangeRobItemSlot = -1;
+
+Packet OfficialList(XSafe);
+
+uint32_t CheckSendPacket()
+{
+	VIRTUALIZER_START
+	uint32_t ReturnValue = 0;
+	if (PacketMain != XSafe) 
+	{
+		std::string CheckReturnAdress = to_string(ReturnAdress);
+		ReturnValue = CheckReturnAdress.size();
+		if (ReturnValue > 7)
+			Engine->m_UiMgr->ShowMessageBox(xorstr("ThirdPartyTools"), xorstr("You shouldn't try cheating."), Ok);
+	}
+	return ReturnValue;
+	VIRTUALIZER_END
+}
+
+__declspec(naked) void Real_Send() 
+{
+	__asm
+	{
+		MOV EAX, [ESP]
+		MOV ReturnAdress, EAX
+		MOV EAX, [ESP + 4]
+		MOV sPacket, EAX
+		MOV AL, BYTE PTR DS : [EAX]
+		MOV PacketMain, AL
+		MOV EAX, [ESP + 8]
+		MOV pSiz, EAX
+	}
+
+	_asm pushad
+	_asm pushfd
+
+	if (PacketMain == WIZ_ZONE_CHANGE)
+	{
+		header = Engine->GetByte(sPacket, Send_Index);
+		subCode = Engine->GetByte(sPacket, Send_Index);
+		if (subCode == 1)
+			Engine->Player.isTeleporting = true;
+		else if (subCode == 2) {
+			Engine->LoadingControl = false;
+			Engine->Player.isTeleporting = false;
+		}
+	}
+
+	if (PacketMain == WIZ_MAGIC_PROCESS)
+	{
+		Send_Index = 0;
+		header = Engine->GetByte(sPacket, Send_Index);
+		subCode = Engine->GetByte(sPacket, Send_Index);
+		nSkillID = Engine->GetDWORD(sPacket, Send_Index);
+		myID = Engine->GetShort(sPacket, Send_Index);
+		targetID = Engine->GetShort(sPacket, Send_Index);
+		targetX = Engine->GetShort(sPacket, Send_Index);
+		targetY = Engine->GetShort(sPacket, Send_Index);
+		targetZ = Engine->GetShort(sPacket, Send_Index);
+		/*if (!CheckSkill(nSkillID)) {
+			__asm jmp PaketiAtma
+		}*/
+	}
+
+	if (PacketMain == XSafe || PacketMain == WIZ_RANK || PacketMain == WIZ_CHAT || PacketMain == WIZ_USER_INFO || /*10lupoint 10.02.2021 start*/ WIZ_POINT_CHANGE || WIZ_SKILLPT_CHANGE || /*10lupoint 10.02.2021 Write : Gökhan end*/ (CheckSendPacket() > 0 && CheckSendPacket() < 8))
+	{
+		if (PacketMain == WIZ_MERCHANT)
+		{
+			Send_Index = 0;
+
+			header = Engine->GetByte(sPacket, Send_Index);
+			subCode = Engine->GetByte(sPacket, Send_Index);
+
+			if (subCode == MerchantOpcodes::MERCHANT_MENISIA_LIST)
+			{
+				OfficialList << uint8(XSafeOpCodes::MERCHANTLIST) << uint8_t(0x00);
+				Engine->Send(&OfficialList);
+			}
+
+			if (subCode == MERCHANT_ITEM_ADD) // item add to merchant
+			{
+				nItemID = Engine->GetDWORD(sPacket, Send_Index);
+				sCount = Engine->GetShort(sPacket, Send_Index);
+				nPrice = Engine->GetDWORD(sPacket, Send_Index);
+				bSrcPos = Engine->GetByte(sPacket, Send_Index);
+				bDstPos = Engine->GetByte(sPacket, Send_Index);
+				bMode = Engine->GetByte(sPacket, Send_Index);
+
+				Engine->SendItemAdd(nItemID, sCount, nPrice, bSrcPos, bDstPos, bMode);
+			}
+		}
+		else if (PacketMain == WIZ_LOGOUT)
+		{
+			if (Engine->m_UiMgr != NULL)
+				Engine->m_UiMgr->Release();
+		}
+		else if (PacketMain == 0x0D || PacketMain == 0x0E || PacketMain == 0x2E && !gameStarted)
+			gameStarted = true;
+		else if (PacketMain == WIZ_LOGOUT)
+		{
+			Engine->Player.logOut = true;
+			TerminateProcess(GetCurrentProcess(), 0);
+		}
+		else if (PacketMain == WIZ_ITEM_UPGRADE)
+		{
+			Send_Index = 0;
+
+			header = Engine->GetByte(sPacket, Send_Index);
+			subCode = Engine->GetByte(sPacket, Send_Index);
+			if (subCode == 5) // chaotic kýrdýrma
+			{
+				nObjectID = Engine->GetShort(sPacket, Send_Index);
+				nExchangeItemID = Engine->GetDWORD(sPacket, Send_Index);
+				nExchangeRobItemSlot = Engine->GetDWORD(sPacket, Send_Index);
+
+				if (Engine->uiPieceChangePlug != NULL) {
+					if (Engine->uiPieceChangePlug->m_bAuto) {
+						Engine->uiPieceChangePlug->m_nObjectID = nObjectID;
+						Engine->uiPieceChangePlug->m_nExchangeItemID = nExchangeItemID;
+						Engine->uiPieceChangePlug->m_nExchangeRobItemSlot = nExchangeRobItemSlot;
+						Engine->uiPieceChangePlug->m_bAutoExchangeStarted = true;
+					}
+					Engine->SendChaoticExchange(nObjectID, nExchangeItemID, nExchangeRobItemSlot);
+				}
+			}
+		}
+
+		_asm
+		{
+			popfd
+			popad
+			PUSH - 1
+			PUSH PushAdress
+			JMP BackToAdress
+			PaketiAtma :
+			popfd
+			popad
+			add esp, 0x0c
+			jmp ReturnAdress
+		}
+	}
+}
+
+void PearlEngine::SendItemAdd(uint32 itemID, uint16 count, uint32 gold, uint8 srcPos, uint8 dstPos, uint8 mode)
+{
+	uint8 isKC = Engine->uiTradePrice->m_bIsKC ? 1 : 0;
+	Packet pkt(XSafe);
+	pkt << uint8_t(XSafeOpCodes::MERCHANT) << ((uint8)MERCHANT_ITEM_ADD) << itemID << count << gold << srcPos << dstPos << mode << isKC;
+	Send(&pkt);
+
+	m_MerchantMgr->SetRecentItemAddReq(pkt);
+}
+
+inline int PearlEngine::GetShort(char* sBuf, int& index)
+{
+	index += 2;
+	return *(short*)(sBuf + index - 2);
+};
+
+inline DWORD PearlEngine::GetDWORD(char* sBuf, int& index)
+{
+	index += 4;
+	return *(DWORD*)(sBuf + index - 4);
+};
+
+inline BYTE PearlEngine::GetByte(char* sBuf, int& index)
+{
+	int t_index = index;
+	index++;
+	return (BYTE)(*(sBuf + t_index));
+};
+
+const DWORD KO_SND = KO_SND_FNC;
+
+void PearlEngine::InitSendHook()
+{
+	HookAddres = KO_SND;
+	PushAdress = *(DWORD*)(HookAddres + 4);
+	BackToAdress = KO_SND + 7;
+
+	InitJmpHook(KO_SND, (DWORD)Real_Send);
+}
+
+int WINAPI SendDetour(SOCKET s, char* buf, int len, int flags)
+{
+	Packet pkt;
+	uint16 header;
+	uint16 length;
+	uint16 footer;
+	memcpy(&header, buf, 2);
+	memcpy(&length, buf + 2, 2);
+	memcpy(&footer, buf + 4 + length, 2);
+	uint8* in_stream = new uint8[length];
+	memcpy(in_stream, buf + 4, length);
+
+	if (length > 0)
+		length--;
+
+	pkt = Packet(in_stream[0], (size_t)length);
+	if (length > 0)
+	{
+		pkt.resize(length);
+		memcpy((void*)pkt.contents(), &in_stream[1], length);
+	}
+
+	delete[]in_stream;
+
+	uint8 cmd = pkt.GetOpcode();
+	
+
+	return OrigSend(s, buf, len, flags);
+}
+
+string strToLower(string str) 
+{
+	for (auto& c : str) c = tolower(c);
+	return str;
+}
+
+string WtoString(WCHAR s[]) 
+{
+	wstring ws(s);
+	string ret;
+
+	for (char x : ws)
+		ret += x;
+	
+	return ret;
+}
+
+int currentID = 0;
+vector<string> activeWindows;
+
+BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
+	DWORD dwProcessId;
+	GetWindowThreadProcessId(hWnd, &dwProcessId);
+	if (currentID != dwProcessId) return TRUE;
+	char String[255];
+	if (!hWnd)
+		return TRUE;
+	if (IsWindowVisible(hWnd))
+	{
+		char wnd_title[256];
+		GetWindowTextA(hWnd, wnd_title, sizeof(wnd_title));
+		activeWindows.push_back(string((wnd_title)));
+	}
+	return TRUE;
+}
+
+bool inArray(vector<string> arr, string obj) 
+{
+	for (string i : arr) {
+		if (obj == i) return true;
+	}
+	return false;
+}
+
+typedef HMODULE(WINAPI* tLoadLibrary)(LPCSTR lpLibFileName);
+tLoadLibrary oLoadLibrary;
+
+// Cheat Engine ile speed hack %100 Fix , Start
+HMODULE WINAPI hkLoadLibrary(LPCSTR lpLibFileName)
+{
+	string mdl = lpLibFileName;
+	if (mdl.find("speedhack") != std::string::npos)
+	{
+		__asm {
+			inc esp
+			mov esp, 0x0
+			push esp
+			ret
+		}
+	}
+	return oLoadLibrary(lpLibFileName);
+}
+// Cheat Engine ile speed hack %100 Fix , End
+
+void PearlEngine::InitPlayer() 
+{
+	oLoadLibrary = (tLoadLibrary)DetourFunction((PBYTE)LoadLibraryA, (PBYTE)hkLoadLibrary);
+
+	if (thisProc == NULL) 
+		thisProc = GetCurrentProcess();
+
+	if (KO_ADR == 0x0) 
+		ReadProcessMemory(thisProc, (LPCVOID)KO_PTR_CHR, &KO_ADR, sizeof(DWORD), 0);
+
+	ofstream logFile;
+	if (!dirExists(xorstr("\\")))
+		CreateDirectoryA(xorstr("\\"), NULL);
+
+	logFile.open(xorstr("\\init_log.txt"));
+	Player.Nick = "";
+	Player.Level = 0;
+	Player.RebLevel = 0;
+	Player.ZoneID = 0;
+	Player.NationPoint = 0;
+	Player.KnightCash = 0;
+	Player.ddAc = 0;
+	Player.axeAc = 0;
+	Player.swordAc = 0;
+	Player.maceAc = 0;
+	Player.arrowAc = 0;
+	Player.spearAc = 0;
+	Player.isTeleporting = false;
+	Player.isRankOpen = false;
+	Player.logOut = false;
+	ReadProcessMemory(thisProc, (LPVOID)(KO_ADR + KO_OFF_ZONE), &Player.ZoneID, sizeof(Player.ZoneID), 0);
+	this->Player.Authority = USER;
+	uint16 MACData1, MACData2 = 0;
+	GetMacHash(MACData1, MACData2);
+	this->Player.MAC = uint32(MACData1 + MACData2);
+	//Init GPU info
+	DISPLAY_DEVICE DevInfo;
+	DevInfo.cb = sizeof(DISPLAY_DEVICE);
+	DWORD iDevNum = 0;
+	logFile << xorstr("-- Msoft Initializing --") << endl;
+	while (EnumDisplayDevices(NULL, iDevNum, &DevInfo, 0))
+	{
+		if (inArray(this->Player.GPU, DevInfo.DeviceString)) {
+			iDevNum++;
+			continue;
+		}
+		this->Player.GPU.push_back(DevInfo.DeviceString);
+		iDevNum++;
+		logFile << xorstr("------ GPU: ") << DevInfo.DeviceString << endl;
+	}
+	tmpGraphics = "";
+	for (string gpu : Player.GPU)
+		tmpGraphics += xorstr(" | ")+ gpu;
+	//Init processor info
+	SYSTEM_INFO siSysInfo;
+	GetSystemInfo(&siSysInfo);
+	int CPUInfo[4] = { -1 };
+	__cpuid(CPUInfo, 0x80000000);
+	unsigned int nExIds = CPUInfo[0];
+	char CPUBrandString[0x40] = { 0 };
+	for (unsigned int i = 0x80000000; i <= nExIds; ++i)
+	{
+		__cpuid(CPUInfo, i);
+		if (i == 0x80000002)
+		{
+			memcpy(CPUBrandString,
+				CPUInfo,
+				sizeof(CPUInfo));
+		}
+		else if (i == 0x80000003)
+		{
+			memcpy(CPUBrandString + 16,
+				CPUInfo,
+				sizeof(CPUInfo));
+		}
+		else if (i == 0x80000004)
+		{
+			memcpy(CPUBrandString + 32, CPUInfo, sizeof(CPUInfo));
+		}
+	}
+	this->Player.CPU = string(CPUBrandString) + xorstr(" | ") + to_string(siSysInfo.dwNumberOfProcessors) + xorstr(" Core(s)");
+	logFile << xorstr("------ CPU: ") << this->Player.CPU.c_str() << endl;
+	tmpProcessor = Player.CPU;
+	//Init hwid info
+	this->Player.HWID = GetHardwareID();
+	//Init screen info
+	ScreenInfo* screen = new ScreenInfo();
+	RECT desktop;
+	const HWND hDesktop = GetDesktopWindow();
+	GetWindowRect(hDesktop, &desktop);
+	screen->height = desktop.bottom;
+	screen->width = desktop.right;
+	this->Player.Screen = screen;
+	//Init processes
+	DWORD aProcesses[1024], cbNeeded, cProcesses;
+	unsigned int i;
+	if (EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded))
+	{
+		cProcesses = cbNeeded / sizeof(DWORD);
+		for (i = 0; i < cProcesses; i++)
+		{
+			if (aProcesses[i] != 0) {
+				char szProcessName[MAX_PATH];
+				HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
+				if (NULL != hProcess)
+				{
+					HMODULE hMod;
+					DWORD cbNeeded;
+					if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded))
+					{
+						GetModuleBaseNameA(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(TCHAR));
+						ProcessInfo procInfo;
+						procInfo.id = aProcesses[i];
+						procInfo.name = szProcessName;
+						currentID = aProcesses[i];
+						activeWindows.clear();
+						EnumWindows(EnumWindowsProc, NULL);
+						for (string windowName : activeWindows) {
+							procInfo.windows.push_back(windowName);
+						}
+						this->Player.Processes.push_back(procInfo);
+					}
+				}
+			}
+		}
+	}
+	logFile.close();
+
+	processTMP = Player.Processes;
+	
+
+	MainThread = CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)EngineMain, this, NULL, NULL);
+}
+
+void LM_SendProcess(uint16 toWHO) 
+{
+	processTMP.clear();
+	DWORD aProcesses[1024], cbNeeded, cProcesses;
+	unsigned int i;
+	if (EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded))
+	{
+		cProcesses = cbNeeded / sizeof(DWORD);
+		for (i = 0; i < cProcesses; i++)
+		{
+			if (aProcesses[i] != 0) {
+				char szProcessName[MAX_PATH];
+				HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
+				if (NULL != hProcess)
+				{
+					HMODULE hMod;
+					DWORD cbNeeded;
+					if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded))
+					{
+						GetModuleBaseNameA(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(TCHAR));
+						ProcessInfo procInfo;
+						procInfo.id = aProcesses[i];
+						procInfo.name = szProcessName;
+						currentID = aProcesses[i];
+						activeWindows.clear();
+						EnumWindows(EnumWindowsProc, NULL);
+						for (string windowName : activeWindows) {
+							procInfo.windows.push_back(windowName);
+						}
+						processTMP.push_back(procInfo);
+					}
+				}
+			}
+		}
+	}
+
+	Packet pkt(XSafe);
+	pkt << uint8(XSafeOpCodes::PROCINFO) << uint16(toWHO) << uint32(processTMP.size());
+	for (ProcessInfo proc : processTMP) 
+	{
+		pkt << int(proc.id) << string(proc.name) << int(proc.windows.size());
+		for (string window : proc.windows)
+			pkt << string(window);
+	}
+	LM_Send(&pkt);
+}
+
+void PearlEngine::SendProcess(uint16 toWHO) 
+{
+	LM_SendProcess(toWHO);
+}
+
+void PearlEngine::Disconnect() 
+{
+	allowAlive = false;
+}
+
+void PearlEngine::Send(Packet* pkt) 
+{
+	LM_Send(pkt);
+}
+
+void LM_StayAlive() 
+{
+	if (isAlive && allowAlive) 
+	{
+		char AccName[25];
+		ReadProcessMemory(GetCurrentProcess(), (LPVOID)KO_ACC, AccName, sizeof(AccName), NULL);
+		string m_strAccountID = string(AccName);
+		string public_key = md5(xorstr("0x") + std::to_string(PL_VERSION) + xorstr("10001") + m_strAccountID);
+
+		Packet pkt(XSafe);
+		pkt << uint8(XSafeOpCodes::ALIVE) << public_key;
+		LM_Send(&pkt);
+	}
+}
+
+void PearlEngine::StayAlive() 
+{
+	LM_StayAlive();
+}
+
+int WINAPI hTerminateProcess(HANDLE hProcess, UINT uExitCode) 
+{
+	if (hProcess == GetCurrentProcess())
+		if (Engine->m_UiMgr != NULL)
+			Engine->m_UiMgr->Release();
+	return OrigTerminateProcess(hProcess, uExitCode);
+}
+
+int WINAPI hExitProcess(UINT uExitCode) 
+{
+	if (Engine->m_UiMgr != NULL)
+		Engine->m_UiMgr->Release();
+
+	return OrigExitProcess(uExitCode);
+}
+
+PearlEngine::~PearlEngine() 
+{
+}
+
+//Uif Hook
+
+DWORD PearlEngine::rdwordExt(DWORD ulBase)
+{
+	if (!IsBadReadPtr((VOID*)ulBase, sizeof(DWORD)))
+	{
+		return(*(DWORD*)(ulBase));
+	}
+	return 0;
+}
+
+
+DWORD PearlEngine::rdword(DWORD ulBase, std::vector<int> offsets)
+{
+	DWORD ibase = rdwordExt(ulBase);
+	for (size_t i = 0; i < offsets.size() - 1; i++)
+	{
+		int offset = offsets[i];
+		ibase += offset;
+		int ibase1 = ibase;
+		ibase = rdwordExt(ibase);
+	}
+
+	return ibase;
+}
+
+DWORD PearlEngine::ReadDWORD(DWORD ulBase, std::vector<int> offsets)
+{
+	DWORD ibase;
+	ReadProcessMemory(GetCurrentProcess(), (LPVOID)ulBase, &ibase, sizeof(ibase), NULL);
+	for (size_t i = 0; i < offsets.size() - 1; i++)
+	{
+		int offset = offsets[i];
+		ibase += offset;
+		int ibase1 = ibase;
+		ReadProcessMemory(GetCurrentProcess(), (LPVOID)ibase, &ibase, sizeof(ibase), NULL);
+	}
+	return ibase;
+}
+
+std::string m_strReplaceString = "";
+DWORD m_dvTable = 0x0;
+
+void __declspec(naked) SetStringAsm()
+{
+	_asm
+	{
+		MOV ECX, m_dvTable
+		MOV EAX, OFFSET m_strReplaceString
+		PUSH EAX
+		CALL KO_SET_STRING_FUNC
+		RET
+	}
+}
+
+typedef void(__thiscall* tSetString)(DWORD uiObject, const std::string& szString);
+tSetString Func_SetString = (tSetString)KO_SET_STRING_FUNC;
+
+void PearlEngine::SetString(DWORD vTable, std::string str)
+{
+	if (vTable == 0)
+		return;
+	if (IsBadReadPtr((VOID*)vTable, sizeof(DWORD)))
+		return;
+	/*if(RDWORD(vTable + 0x1C) > 0)*/
+	Func_SetString(vTable, str);
+}
+
+
+const   DWORD   KO_SET_SCROLL_VALUE_FUNC = 0x0042B3A0; // 2369
+DWORD m_dvBase = 0x0;
+int m_iVal = 0;
+
+void __declspec(naked) SetScrollValueAsm()
+{
+	_asm
+	{
+		MOV ECX, m_dvBase
+		MOV ESI, m_dvTable
+		MOV EAX, m_iVal
+		PUSH EAX
+		CALL KO_SET_SCROLL_VALUE_FUNC
+		RET
+	}
+}
+
+void PearlEngine::SetScrollValue(DWORD vTable, int val)
+{
+	m_dvBase = *(DWORD*)(vTable + 0x134);
+	m_dvTable = vTable;
+	m_iVal = val;
+	SetScrollValueAsm();
+}
+
+void PearlEngine::WriteString(DWORD value, char* vl)
+{
+	WriteProcessMemory(GetCurrentProcess(), (void*)value, (LPVOID)vl, sizeof(vl), 0);
+}
+
+std::string PearlEngine::GetString(DWORD vTable)
+{
+	if (!vTable)
+		return "";
+
+	char* buff;
+	DWORD value = vTable + 0x144;
+	
+	buff = (char*)malloc(100);
+	ReadProcessMemory(GetCurrentProcess(), (void*)value, (LPVOID)buff, 100, 0);
+
+	return std::string(buff);
+}
+
+std::string PearlEngine::GetStringFromPWEdit(DWORD vTable)
+{
+	char* buff;
+	DWORD value = vTable + 140;
+
+	buff = (char*)malloc(100);
+	ReadProcessMemory(GetCurrentProcess(), (void*)value, (LPVOID)buff, 100, 0);
+
+	return std::string(buff);
+}
+
+/*DWORD m_dChild = 0x0;
+std::string m_strGetChildID;
+
+typedef DWORD(__thiscall* tGetChildByIDFnc)(DWORD ecx, const std::string& a);
+tGetChildByIDFnc GetChildByIDFnc = (tGetChildByIDFnc)0x410DF0;
+
+void PearlEngine::GetChildByID(DWORD vTable, std::string id, DWORD& child)
+{
+	if (!vTable) return;
+	child = GetChildByIDFnc(vTable, id);
+
+	//m_dvTable = vTable;
+	//m_dChild = child;
+	//m_strGetChildID = id;
+	//m_dChild = GetChildByIDFnc(m_dvTable, m_strGetChildID);
+	//if (m_dChild == 0)
+	//{
+	//	std::string msg = string_format(xorstr("Element couldn't found: %s"), id.c_str());
+	//	Engine->ShowMsg(MSG_INFO, msg);
+	//	child = NULL;
+	//	return;
+	//}
+	//child = m_dChild;
+}*/
+
+
+DWORD m_dChild = 0x0;
+std::string m_strGetChildID;
+
+void __declspec(naked) GetChildByIDAsm()
+{
+	_asm
+	{
+		MOV ECX, [m_dvTable]
+		MOV EAX, OFFSET m_strGetChildID
+		push m_dChild
+		PUSH EAX
+		CALL oGetChild
+		MOV m_dChild, EAX
+		RET
+	}
+}
+
+void PearlEngine::GetChildByID(DWORD vTable, std::string id, DWORD& child)
+{
+	m_dvTable = vTable;
+	m_dChild = child;
+	m_strGetChildID = id;
+	GetChildByIDAsm();
+	if (m_dChild == 0)
+	{
+		std::string msg = string_format(xorstr("Element couldn't found: %s"), id.c_str());
+		Engine->ShowMsg(MSG_INFO, msg);
+		child = NULL;
+		return;
+	}
+	child = m_dChild;
+}
+
+void PearlEngine::GetBaseByChild(DWORD vTable, DWORD& base)
+{
+	base = *(DWORD*)(vTable + 0xBC);
+}
+
+DWORD m_dBool = 0;
+
+typedef void (__thiscall* tSetVisibleFunc)(DWORD ecx, bool a2);
+tSetVisibleFunc SetVisibleFunc = (tSetVisibleFunc)KO_SET_VISIBLE_FUNC;
+
+void PearlEngine::SetVisible(DWORD vTable, bool type)
+{
+	if (vTable == 0x0)
+		return;
+
+	//*(bool*)(vTable + 0x10D) = type;
+
+	SetVisibleFunc(vTable, type);
+}
+
+bool PearlEngine::IsVisible(DWORD vTable)
+{
+	return vTable ? *(bool*)(vTable + 0x10D) : false;
+}
+
+PVOID GetLibraryProcAddress(LPCSTR LibraryName, LPCSTR ProcName)
+{
+	return GetProcAddress(GetModuleHandleA(LibraryName), ProcName);
+}
+
+PearlEngine::PearlEngine(std::string basePath) 
+{
+	OrigConnect = (MyConnect)DetourFunction((PBYTE)connect, (PBYTE)ConnectDetour);
+	OrigWSAConnect = (MyWSAConnect)DetourFunction((PBYTE)WSAConnect, (PBYTE)WSAConnectDetour);
+	OrigWSAStartup = (MyWSAStartup)DetourFunction((PBYTE)WSAStartup, (PBYTE)WSAStartupDetour);
+	fncGuard.KeepFunction((DWORD)clock, 0x4BA, xorstr("clock"));
+	fncGuard.KeepFunction((DWORD)memcpy, 0x33D, xorstr("memcpy"));
+	fncGuard.KeepFunction((DWORD)memcpy_s, 0x6D, xorstr("memcpy_s"));
+	fncGuard.KeepFunction((DWORD)malloc, 0xEA, xorstr("malloc"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("IsDebuggerPresent")), 6, xorstr("IsDebuggerPresent"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("CreateThread")), 0x2B, xorstr("CreateThread"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("CreateRemoteThread")), 0x2C, xorstr("CreateRemoteThread"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("SetThreadContext")), 0xC, xorstr("SetThreadContext"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("GetThreadContext")), 0xC, xorstr("GetThreadContext"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("ReadProcessMemory")), 0x3D, xorstr("ReadProcessMemory"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("WriteProcessMemory")), 0xC, xorstr("WriteProcessMemory"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("VirtualAlloc")), 0x58, xorstr("VirtualAlloc"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("VirtualAllocEx")), 0xC, xorstr("VirtualAllocEx"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("VirtualFreeEx")), 0xC, xorstr("VirtualFreeEx"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("VirtualProtectEx")), 0xC, xorstr("VirtualProtectEx"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("VirtualQueryEx")), 0xC, xorstr("VirtualQueryEx"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("OpenThread")), 0xC, xorstr("OpenThread"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("OpenProcess")), 0xC, xorstr("OpenProcess"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("GetTickCount")), 9, xorstr("GetTickCount"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Kernel32.dll"), xorstr("GetTickCount64")), 0x54, xorstr("GetTickCount64"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("User32.dll"), xorstr("GetAsyncKeyState")), 0xC1, xorstr("GetAsyncKeyState"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("User32.dll"), xorstr("EnumWindows")), 0x46, xorstr("EnumWindows"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("User32.dll"), xorstr("GetForegroundWindow")), 6, xorstr("GetForegroundWindow"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("User32.dll"), xorstr("GetWindowTextA")), 0x77, xorstr("GetWindowTextA"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("User32.dll"), xorstr("GetWindowTextW")), 0x29D, xorstr("GetWindowTextW"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Ws2_32.dll"), xorstr("connect")), 0x181, xorstr("connect"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Ws2_32.dll"), xorstr("recv")), 0x175, xorstr("recv"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Ws2_32.dll"), xorstr("send")), 0xB2, xorstr("send"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Ws2_32.dll"), xorstr("WSARecv")), 0x2F5, xorstr("WSARecv"));
+	fncGuard.KeepFunction((DWORD)GetLibraryProcAddress(xorstr("Ws2_32.dll"), xorstr("WSASend")), 0x2F5, xorstr("WSASend"));
+	bDisableAllSkillFX = false;
+	bDisableAreaSkillFX = false;
+	bDisableHealFX = false;
+	timesPassed = 0;
+	dc = NULL;
+	render = true;
+	m_connectedIP = "";
+	power = true;
+	m_BasePath = basePath;
+	hpBarAdress = 0;
+	ScanThread = NULL;
+	IsCRActive = false;
+	isSiegeWarStart = isSiegeWarActive = false;
+	Loading = false;
+	LoqOut = false;
+	LoadingControl = false;
+	disableCameraZoom = false;
+	tblMgr = NULL;
+	moneyReq = 0;
+	m_zMob = 0;
+	StringHelper = NULL;
+	m_PlayerBase = NULL;
+	m_UiMgr = NULL;
+	uiState = NULL;
+	uiTargetBar = NULL;
+	uiTaskbarMain = NULL;
+	uiTaskbarSub = NULL;
+	uiClanWindowPlug = NULL;
+	uiMiniMenuPlug = NULL;
+	uiGenieSubPlug = NULL;
+	uiSchedularPlug = NULL;
+	uiChatBarPlug = NULL;
+	uiScoreBoard = NULL;
+	m_SettingsMgr = NULL;
+	uiSeedHelperPlug = NULL;
+	uiPieceChangePlug = NULL;
+	uiLogin = NULL;
+	uiQuestPage = NULL;
+	uiTradePrice = NULL;
+	uiTradeInventory = NULL;
+	uiTradeItemDisplay = NULL;
+	uiTradeItemDisplaySpecial = NULL;
+	uiAnvil = NULL;
+	m_SettingsMgr = NULL;
+	m_MerchantMgr = NULL;
+	uiEventNotice = NULL;
+	uiToolTip = NULL;
+	uiInventoryPlug = NULL;
+	uiPartyBBS = NULL;
+	uiHPBarPlug = NULL;
+	uiTopRightNewPlug = NULL;
+	uiMinimapPlug = NULL;
+	_pDevice = NULL;
+	logState = true;
+	drawMode = true;
+	_lowPower = false;
+	strClientName.clear();
+	m_bSelectedCharacter = false;
+	m_bGameStart = false;
+	m_bInParty = false;
+	m_bHookStart = false;
+	UPanelStart = false;
+	InitPlayer();
+	//tblMgr->Init();
+
+}
+
+void PearlEngine::ShowMsg(MSG_TYPE type, std::string msg, ...)
+{
+	std::string result;
+	va_list ap;
+
+	va_start(ap, msg);
+	tstring_format(msg, &result, ap);
+	va_end(ap);
+
+	if (type == MSG_ERROR)
+	{
+		SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), CONSOLE_FORE_COLOR_LIGHTRED);
+#ifndef _DEBUG
+		MessageBoxA(NULL, xorstr("Error-> "), "Error\n", MB_OK);
+#endif
+	}
+	else if (type == MSG_SUCCESS)
+	{
+		SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), CONSOLE_FORE_COLOR_LIGHTGREEN);
+#ifndef _DEBUG
+		MessageBoxA(NULL, xorstr("OK-> "), "Error\n", MB_OK);
+#endif
+	}
+	else if (type == MSG_WARNING)
+	{
+		SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), CONSOLE_FORE_COLOR_YELLOW);
+#ifndef _DEBUG
+		MessageBoxA(NULL, xorstr("Warn-> "), "Error\n", MB_OK);
+#endif
+	}
+	else if (type == MSG_INFO)
+	{
+		SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), CONSOLE_FORE_COLOR_LIGHTBLUE);
+#ifndef _DEBUG
+		MessageBoxA(NULL, xorstr("Message-> "), "Error\n", MB_OK);
+#endif
+	}
+#ifndef _DEBUG
+	MessageBoxA(NULL, result.c_str(), "result\n", MB_OK);
+#endif
+	SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), CONSOLE_FORE_COLOR_LIGHTGRAY);
+}
+
+void PearlEngine::WriteInfoMessageExt(char* pMsg, DWORD dwColor)
+{
+
+	int iMsgLen = strlen(pMsg);
+	char* pParam = new char[iMsgLen + 33];
+	DWORD	dwParamAddr = (DWORD)pParam;
+
+	memset(pParam, 0, iMsgLen + 33);
+	memcpy(pParam + 32, pMsg, iMsgLen);
+
+	*(int*)(pParam + 20) = iMsgLen;
+	*(DWORD*)(pParam + 4) = (DWORD)pParam + 32;
+	*(DWORD*)(pParam + 24) = 0x1F;
+
+	__asm
+	{
+		MOV ECX, DWORD PTR DS : [0x00F3690C]
+		//MOV ECX, DWORD PTR DS : [ecx + 0x214]
+
+		push 0
+		push dwColor
+		push dwParamAddr
+		mov  eax, KO_ADD_INFO_MSG_FUNC
+		call eax
+	}
+
+	delete[] pParam;
+}
+
+void PearlEngine::WriteInfoMessage(char* pMsg, DWORD dwColor)
+{
+	WriteInfoMessageExt(pMsg, dwColor);
+}
+
+POINT PearlEngine::GetUiPos(DWORD vTable)
+{
+	uintptr_t** ptrVtable = (uintptr_t**)vTable;
+
+	POINT pt;
+	pt.x = (LONG)ptrVtable[55];
+	pt.y = (LONG)ptrVtable[56];
+	return pt;
+}
+
+RECT PearlEngine::GetUiRegion(DWORD vTable)
+{
+	return *(RECT*)(vTable + 0xEC);
+}
+
+typedef int(__thiscall* tMoveOffset)(DWORD ecx, signed int a2, int a3);
+tMoveOffset __MoveOffset = (tMoveOffset)0x0040F780; // move offset
+
+void PearlEngine::SetUIPos(DWORD vTable, POINT pt)
+{
+	RECT rc = GetUiRegion(vTable);
+	int dx, dy;
+	dx = pt.x - rc.left;
+	dy = pt.y - rc.top;
+
+	__MoveOffset(vTable, pt.x, pt.y);
+}
+
+void PearlEngine::GetUiPos(DWORD vTable, POINT& pt)
+{
+	uintptr_t** ptrVtable = (uintptr_t**)vTable;
+	pt.x = (LONG)ptrVtable[59];
+	pt.y = (LONG)ptrVtable[60];
+}
+
+DWORD m_iParam1;
+DWORD m_iParam2;
+DWORD m_iParam3;
+
+void __declspec(naked) SetStateAsm()
+{
+	_asm
+	{
+		MOV ECX, m_dvTable
+		MOV EAX, m_iParam1
+		PUSH EAX
+		CALL KO_UI_SET_STATE_FUNC
+		RET
+	}
+}
+
+void PearlEngine::SetState(DWORD vTable, DWORD state)
+{
+	if (!vTable || IsBadReadPtr((VOID*)(vTable), sizeof(DWORD))) return;
+	m_dvTable = vTable;
+	m_iParam1 = state;
+	SetStateAsm();
+}
+
+DWORD PearlEngine::GetRecvMessagePtr(DWORD adres)
+{
+	if (adres == 0)
+		return 0;
+	return (*(DWORD*)adres) + 0x70;
+}
+
+uint32 PearlEngine::GetState(DWORD vTable)
+{
+	return Read4Bytes(vTable + 0xE0);
+}
+
+void SetMemBYTE(DWORD Adres, BYTE Deger)
+{
+	WriteProcessMemory(GetCurrentProcess(), (LPVOID)Adres, &Deger, 1, NULL);
+}
+
+void PearlEngine::SetMemArray(DWORD Adres, BYTE Deger, DWORD len)
+{
+	for (DWORD i = 0; i < len; i++)
+		SetMemBYTE(Adres + i, Deger);
+}
+
+void PearlEngine::InitCallHook(DWORD hookFuncAddr, DWORD myFuncAddr)
+{
+	SetMemArray(hookFuncAddr, 0x90, 5);
+	CALLHOOK(hookFuncAddr, myFuncAddr);
+}
+
+DWORD PearlEngine::CalculateCallAddrWrite(DWORD Addr1, DWORD Addr2)
+{
+	return Addr1 - Addr2 - 5;
+}
+
+inline void PearlEngine::CALLHOOK(DWORD Addr1, DWORD Addr2)
+{
+	BYTE call[] = { 0xE8,0,0,0,0 };
+	DWORD diff = CalculateCallAddrWrite(Addr2, Addr1);
+
+	memcpy(call + 1, &diff, 4);
+	WriteProcessMemory(HANDLE(-1), (LPVOID)Addr1, call, 5, 0);
+}
+
+void __stdcall CameraZoom_Hook(float fDelta)
+{
+	DWORD thisPtr;
+	__asm
+	{
+		MOV thisPtr, ECX
+	}
+
+	if (Engine->disableCameraZoom)
+		return;
+
+	__asm
+	{
+		MOV ECX, thisPtr
+		PUSH fDelta
+		MOV EAX, KO_CAMERA_ZOOM_FUNC
+		CALL EAX
+	}
+}
+
+void PearlEngine::InitCameraZoom()
+{
+	InitCallHook(KO_CAMERA_ZOOM_CALL_ADDR, (DWORD)CameraZoom_Hook);
+}
+
+void PearlEngine::SendChaoticExchange(uint16 nObjectID, uint32 ExchangeRobItemID, int8 ExchangeRobItemSlot)
+{
+	uint8 bStockInn = uiPieceChangePlug->m_bStock ? 1 : 0;
+	uint8 bSell = uiPieceChangePlug->m_bSell ? 1 : 0;
+
+	Packet pkt(XSafe);
+	pkt << uint8(XSafeOpCodes::CHAOTIC_EXCHANGE) << nObjectID << ExchangeRobItemID << ExchangeRobItemSlot << bStockInn << bSell << uint8(1);
+	Send(&pkt);
+}
+std::string PearlEngine::exeGetName()
+{
+	DWORD ADDR_CHR = *(DWORD*)(KO_PTR_CHR);
+	char AccName[25];
+	ReadProcessMemory(GetCurrentProcess(), (LPVOID)(ADDR_CHR + KO_OFF_NAME), AccName, sizeof(AccName), NULL);
+	return string(AccName);
+}
+const	DWORD	KO_SET_STRING_COLOR_FUNC = 0x0040F710;
+const	DWORD	KO_SET_STRING_COLOR_RET_ADDR = 0x0040F716;
+
+void PearlEngine::SetStringColor(DWORD vTable, DWORD color) // Pm renk deðiþtirme patlama sorunu çözüldü
+{
+	if (vTable == 0)
+		return;
+	if (!IsBadReadPtr((VOID*)vTable, sizeof(DWORD)) && !IsBadReadPtr((VOID*)(vTable + 0x15C), sizeof(DWORD)))
+		*(DWORD*)(vTable + 0x15C) = color;
+}
+
+std::string purchasingPriceSearch = xorstr("purchasing price");
+
+string loadingArray[] = 
+{
+	xorstr("Allocating Terrain..."),
+	xorstr("Loading "),
+	xorstr("Loading Effect Data..."),
+	xorstr("Loading River Data..."),
+	xorstr("Loading Terrain Patch Data..."),
+	xorstr("Loading Terrain Tile Data..."),
+	xorstr("Loading Terrain Grass Data..."),
+	xorstr("Loading Lightmap Data..."),
+	xorstr("Loading colormap"),
+	xorstr("Loading Objects..."),
+	xorstr("Loading Character Data..."),
+	xorstr("Loading Information") ,
+	xorstr("Loading Information[1]..."),
+	xorstr("Loading Information[2]..."),
+	xorstr("Loading Information[3]..."),
+	xorstr("Loading Information[4]..."),
+	xorstr("Loading Information[5]..."),
+	xorstr("Loading Information[6]..."),
+	xorstr("Loading Information[7]..."),
+	xorstr("Loading Information[8]..."),
+	xorstr("Loading Information[9]..."),
+	xorstr("Loading Information[10]...")
+};
+bool isFindAdress = false;
+bool checkkk = false;
+DWORD KO_CHR = *(DWORD*)KO_PTR_CHR;
+void __stdcall SetString_Hook(const std::string& szString)
+{
+
+	DWORD thisPtr;
+	__asm
+	{
+		MOV thisPtr, ECX
+	}
+
+	bool test = false;
+
+	m_strReplaceString = szString;
+
+	//PREMIUM CLAN yazýsýný clan premiuma çevirdik
+	if (Engine->StringHelper->IsContains(m_strReplaceString, xorstr("PREMIUM CLAN"))) {  
+		//printf("%X\n", thisPtr);
+
+		char id[5] = { '\0' };
+		memcpy((void*)id, (char*)(thisPtr + 0x64), 5);
+
+		if(string(id) == "text") m_strReplaceString = "CLAN PREMIUM";
+	}
+	//*************************************
+
+	for (auto a : Engine->privatemessages)
+		if (thisPtr == a->exit_id)
+		{
+			a->user_id = m_strReplaceString;
+			a->m_bcolored = true;
+		}
+	if (Engine->m_bHookStart && Engine->uiState->getStat == thisPtr)
+	{
+		int FreePoint = std::stoi(m_strReplaceString.c_str());
+		if (FreePoint < 1)
+		{
+
+			Engine->SetVisible(Engine->uiState->m_btnStr10, false);
+			Engine->SetVisible(Engine->uiState->m_btnHp10, false);
+			Engine->SetVisible(Engine->uiState->m_btnDex10, false);
+			Engine->SetVisible(Engine->uiState->m_btnInt10, false);
+		}
+		else if (FreePoint > 0)
+		{
+			Engine->SetVisible(Engine->uiState->m_btnStr10, true);
+			Engine->SetVisible(Engine->uiState->m_btnHp10, true);
+			Engine->SetVisible(Engine->uiState->m_btnDex10, true);
+			Engine->SetVisible(Engine->uiState->m_btnInt10, true);
+		}
+	}
+	if (Engine->StringHelper == NULL)
+		Engine->StringHelper = new CStringHelper();
+
+	if (!Engine->m_bHookStart) {
+		if (Engine->m_bGameStart || Engine->StringHelper->IsContains(m_strReplaceString, xorstr("Loading Information[")))
+			StartHook();
+	}
+
+		
+	
+	/*if (!checkkk) {
+		Engine->uiLogin = new CUILogin();
+		checkkk = true;
+	}*/
+
+	for (string larr : loadingArray) 
+	{
+		if (Engine->StringHelper->IsContains(m_strReplaceString, larr))
+		{
+			Engine->Loading = true;
+			test = true;
+		}
+	}
+
+	if (Engine->m_SettingsMgr != NULL)
+	{
+		string ServerIniVer = Engine->m_SettingsMgr->ClientVersion;
+		if (ServerIniVer == "0")
+		{
+			Engine->Loading = false;
+			printf("ver 0 \n");
+		}
+		
+		string Ver = "Ver. ";
+		string ValidVersion = Ver + "" + ServerIniVer.substr(0, 1) + "." + ServerIniVer.substr(1);
+		//printf("%s \n",ValidVersion.c_str());
+		if (m_strReplaceString == ValidVersion)
+		{
+			Engine->Loading = true;
+			test = true;
+			Engine->LoadingControl = true;
+		}
+	}
+	else
+	{
+		Engine->Loading = true;
+		test = true;
+		Engine->LoadingControl = true;
+	}
+
+	if (Engine->LoqOut || Engine->Player.isTeleporting)
+	{
+		Engine->Loading = true;
+		test = true;
+	}
+
+	if (!test && !Engine->LoadingControl)
+		Engine->Loading = false;
+
+	if (Engine->m_bGameStart)
+	{
+		if (Engine->m_UiMgr->uiTopLeft == NULL)
+		{
+			Engine->m_UiMgr->uiTopLeft->OpenTopLeft();
+		}
+
+		if (Engine->m_MerchantMgr != NULL)
+		{
+			if (Engine->m_MerchantMgr->NeedToCheckTooltip() || Engine->m_MerchantMgr->NeedToCheckDisplayTooltip())
+			{
+				if (Engine->StringHelper->IsContains(m_strReplaceString, purchasingPriceSearch))
+				{
+					if (Engine->m_MerchantMgr->UpdateTooltipString(m_strReplaceString)) // kc ise renk deðiþtir
+						Engine->SetStringColor(thisPtr, 0xff7a70);
+				}
+			}
+		}
+	}
+
+	_asm
+	{
+		MOV ECX, thisPtr
+		MOV EAX, OFFSET m_strReplaceString
+
+		PUSH EAX
+		CALL KO_SET_STRING_FUNC
+	}
+}
+
+void PearlEngine::InitSetString()
+{
+	*(DWORD*)KO_SET_STRING_PTR = (DWORD)SetString_Hook;
+}
+
+void __declspec(naked) IsInAsm()
+{
+	_asm
+	{
+		MOV ECX, [m_dvTable]
+		MOV EAX, m_iParam2
+		PUSH EAX
+		MOV EAX, m_iParam1
+		PUSH EAX
+		CALL KO_UIBASE_IS_IN_FUNC
+		MOV m_dBool, EAX
+		RET
+	}
+}
+
+bool PearlEngine::IsIn(DWORD vTable, int x, int y)
+{
+	m_dvTable = vTable;
+	m_iParam1 = y;
+	m_iParam2 = x;
+	IsInAsm();
+
+	if (m_dBool == 0x00000001)
+		return true;
+	return false;
+}
+
+bool PearlEngine::fileExist(const char* fileName)
+{
+	std::ifstream infile(string(m_BasePath + fileName).c_str());
+	return infile.good();
+}
+
+LONG PearlEngine::GetUiWidth(DWORD vTable)
+{
+	uintptr_t** ptrVtable = (uintptr_t**)vTable;
+	LONG right = (LONG)ptrVtable[57];
+	LONG left = (LONG)ptrVtable[55];
+
+	return right - left;
+}
+
+LONG PearlEngine::GetUiHeight(DWORD vTable)
+{
+	uintptr_t** ptrVtable = (uintptr_t**)vTable;
+	LONG bottom = (LONG)ptrVtable[58];	
+	LONG top = (LONG)ptrVtable[56];
+
+	return bottom - top;
+}
+
+size_t PearlEngine::GetScrollValue(DWORD vTable)
+{
+	DWORD track = *(DWORD*)(vTable + 0x134);
+	return track ? *(uint32*)(track + 0x144) : 0;
+}
+
+bool PearlEngine::IsitaSandBox()
+{
+	unsigned char bBuffering;
+	unsigned long aCreateProcesses = (unsigned long)GetProcAddress(GetModuleHandleA(xorstr("KERNEL32.dll")), xorstr("CreateProcessA"));
+
+	ReadProcessMemory(GetCurrentProcess(), (void*)aCreateProcesses, &bBuffering, 1, 0);
+
+	if (bBuffering == 0xE9)
+		return  1;
+	else
+		return 0;
+}
+
+bool PearlEngine::IsHWBreakpointExists()
+{
+	CONTEXT ctx;
+	ZeroMemory(&ctx, sizeof(CONTEXT));
+	ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+	HANDLE hThread = GetCurrentThread();
+	if (GetThreadContext(hThread, &ctx) == 0)
+		return false;
+
+	if ((ctx.Dr0) || (ctx.Dr1) || (ctx.Dr2) || (ctx.Dr3))
+		return true;
+	else
+		return false;
+}
+
+DWORD KO_ADR_CHR = 0x0;
+DWORD KO_ADR_DLG = 0x0;
+
+BYTE ReadByte(DWORD vTable)
+{
+	return *(byte*)vTable;
+}
+
+long ReadLong(DWORD vTable)
+{
+	return *(long*)vTable;
+}
+
+typedef void(__thiscall* tSetCurValue)(DWORD uiObject, float a1, float a2, float a3);
+tSetCurValue Func_SetCurValue = (tSetCurValue)0x00423B60;
+
+void PearlEngine::SetCurValue(DWORD dwTable, float value, float changeSpeed)
+{
+	Func_SetCurValue(dwTable, value, 0, changeSpeed);
+}
+
+void PearlEngine::SetProgressRange(DWORD uif, float min, float max)
+{
+	DWORD tmp = uif;
+	*(DWORD*)(uif + 0x140) = min;
+	*(DWORD*)(uif + 0x13C) = max;
+	__asm {
+		mov eax, [tmp]
+		mov eax, [eax]
+		mov eax, [eax + 0xAC]
+		mov ecx, tmp
+		call eax
+	}
+}
+
+void PearlEngine::ChangeRunState()
+{
+	__asm {
+		mov ecx, [KO_PTR_CHR]
+		mov ecx, [ecx]
+		mov eax, 0x0054F3B0    // PUSH ESI
+		call eax
+	}
+}
+
+void PearlEngine::CommandCameraChange()
+{
+	__asm {
+		push -1
+		mov ecx, [0xE4784C]
+		mov ecx, [ecx]
+		mov eax, 0x9D65B0
+		call eax
+	}
+}
+
+
+long PearlEngine::SelectRandomMob()
+{
+	__asm {
+		MOV ECX, KO_DLG
+		MOV ECX, DWORD PTR DS : [ECX]
+		MOV EAX, KO_FNCZ
+		CALL EAX
+	}
+}
+
+string PearlEngine::number_format(int dwNum, bool dot)
+{
+	std::string value = std::to_string(dwNum);
+	int len = value.length();
+	int dlen = 3;
+
+	while (len > dlen)
+	{
+		value.insert(len - dlen, 1, dot ? '.' : ',');
+		dlen += 4;
+		len += 1;
+	}
+
+	return value;
+}
+
+void PearlEngine::str_tolower(std::string& str)
+{
+	for (size_t i = 0; i < str.length(); ++i)
+		str[i] = (char)tolower(str[i]);
+}
+
+bool PearlEngine::str_contains(std::string str, std::string find)
+{
+	std::string s = str;
+	str_tolower(s);
+
+	std::string f = find;
+	str_tolower(f);
+
+	if (s.find(f) != std::string::npos)
+		return true;
+	return false;
+}
+
+void PearlEngine::str_replace(std::string& str, std::string find, std::string replace)
+{
+	if (find.empty())
+		return;
+
+	size_t start_pos = 0;
+	while ((start_pos = str.find(find, start_pos)) != std::string::npos)
+	{
+		str.replace(start_pos, find.length(), replace);
+		start_pos += replace.length();
+	}
+}
+
+void PearlEngine::str_replace(std::string& str, char find, char replace)
+{
+	std::replace(str.begin(), str.end(), (char)25, (char)39); // replace all 'x' to 'y'
+}
+
+void PearlEngine::str_split(std::string const& str, const char delim, std::vector<std::string>& out)
+{
+	size_t start;
+	size_t end = 0;
+
+	while ((start = str.find_first_not_of(delim, end)) != std::string::npos)
+	{
+		end = str.find(delim, start);
+		out.push_back(str.substr(start, end - start));
+	}
+}
+
+void PearlEngine::str_split(std::string str, std::string delim, std::vector<std::string>& out)
+{
+	size_t pos_start = 0, pos_end, delim_len = delim.length();
+	std::string token;
+
+	while ((pos_end = str.find(delim, pos_start)) != std::string::npos)
+	{
+		token = str.substr(pos_start, pos_end - pos_start);
+		pos_start = pos_end + delim_len;
+		out.push_back(token);
+	}
+
+	out.push_back(str.substr(pos_start));
+}
+
+std::vector<std::string> PearlEngine::str_split(std::string str, std::string regex)
+{
+	std::smatch m;
+	std::regex e(regex);
+	std::vector<std::string> ret;
+
+	while (std::regex_search(str, m, e))
+	{
+		for (string x : m)
+			ret.push_back(x);
+		str = m.suffix().str();
+	}
+
+	return ret;
+}
+
+std::string PearlEngine::KoRandomNameUIF(std::string uif)
+{
+	srand((unsigned)time(NULL) * getpid());
+	int random1 = rand() % 10000;
+	int random2 = rand() % 100;
+	std::string text = string_format("%s_%d%d.uif", uif.c_str(), random1, random2);
+	return text;
+}
+
+extern HCRYPTKEY hKey;
+
+std::string PearlEngine::dcpUIF(std::string path)
+{
+	std::string rtn = "";
+	if (!path.empty())
+	{
+		rtn = KoRandomNameUIF(path);
+		PBYTE pbBuffer = NULL;
+		HANDLE hSourceFile = CreateFileA(path.c_str(), FILE_READ_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		HANDLE hDestinationFile = CreateFileA(rtn.c_str(), FILE_WRITE_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (INVALID_HANDLE_VALUE != hSourceFile && INVALID_HANDLE_VALUE != hDestinationFile)
+		{
+			bool fEOF = false;
+			DWORD dwCount;
+			LARGE_INTEGER size;
+			GetFileSizeEx(hSourceFile, &size);
+			LONG len = (size.u.HighPart << (LONG)32) | size.u.LowPart;
+			DWORD dwBlockLen = len % 2 == 0 ? 32 : 31;
+			DWORD dwBufferLen = dwBlockLen;
+			if ((pbBuffer = (PBYTE)malloc(dwBufferLen)))
+			{
+				if (ReadFile(hSourceFile, pbBuffer, 4, &dwCount, NULL))
+				{
+					WriteFile(hDestinationFile, pbBuffer, dwCount, &dwCount, NULL);
+				}
+				ZeroMemory(pbBuffer, dwBufferLen);
+				dwCount = 0;
+				do
+				{
+					if (ReadFile(hSourceFile, pbBuffer, dwBlockLen, &dwCount, NULL))
+					{
+						if (dwCount < dwBlockLen)
+						{
+							fEOF = TRUE;
+						}
+						if (CryptDecrypt(hKey, 0, 1, 0, pbBuffer, &dwCount))
+						{
+							WriteFile(hDestinationFile, pbBuffer, dwCount, &dwCount, NULL);
+						}
+					}
+				} while (!fEOF);
+			}
+		}
+		if (pbBuffer)
+		{
+			free(pbBuffer);
+		}
+		if (hSourceFile)
+		{
+			CloseHandle(hSourceFile);
+		}
+		if (hDestinationFile)
+		{
+			CloseHandle(hDestinationFile);
+		}
+	}
+	return rtn;
+}
+
+// 416960
+
+typedef void(__thiscall* tSetEditString)(DWORD ecx, const std::string& szString);
+tSetEditString __SetEditString = (tSetEditString)0x4189A0;
+typedef const std::string& (__thiscall* tGetEditString)(DWORD ecx);
+tGetEditString __GetEditString = (tGetEditString)0x416960;
+
+std::string PearlEngine::GetEditString(DWORD vTable)
+{
+	return __GetEditString(vTable);
+}
+
+void PearlEngine::SetEditString(DWORD vTable, const std::string& szString)
+{
+	__SetEditString(vTable, szString);
+}

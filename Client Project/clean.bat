@@ -1,0 +1,5 @@
+rmdir /s /q "HSACSGuard/Debug"
+rmdir /s /q "HSACSGuard/Release"
+rmdir /s /q ".vs"
+rmdir /s /q ".cr"
+rmdir /s /q "Release"

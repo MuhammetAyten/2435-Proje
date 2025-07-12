@@ -5,4 +5,5 @@
 * Project owner is twostars
 
 * Project Developers ;
-  - YNG  / Source Code [ Discord : volkansutcu ]
+  - YNG  / Source Code
+  - Muhammet Ayten / Source Code
